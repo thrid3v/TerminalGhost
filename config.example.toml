@@ -1,0 +1,55 @@
+# TerminalGhost — example configuration
+# Copy to ~/.config/terminalghost/config.toml and edit as needed.
+# All values shown here are the built-in defaults.
+
+[general]
+# Maximum number of commands kept in the rolling buffer
+history_size = 200
+# Path to the SQLite database (~ expands to home dir)
+db_path = "~/.local/share/terminalghost/history.db"
+# Unix socket path the daemon listens on (shell hooks write here)
+socket_path = "/tmp/terminalghost.sock"
+# PID file location
+pid_file = "/tmp/terminalghost.pid"
+
+[capture]
+# Redact output lines that look like password prompts before storing
+redact_passwords = true
+# Commands whose output should never be stored (regex list)
+blocked_commands = ["gpg", "pass", "secret-tool"]
+# Maximum bytes of output stored per command (prevents huge log entries)
+max_output_bytes = 4096
+# Whether to use the PTY wrapper (true) or rely solely on shell hooks (false)
+use_pty = false
+
+[context]
+# Max directory tree depth when assembling prompt context
+tree_depth = 3
+# Directories to skip in the tree walk
+tree_ignore = [".git", "__pycache__", "node_modules", ".venv"]
+# Approximate token budget for the assembled context sent to the LLM
+token_budget = 3000
+
+[llm]
+# Which backend to use: "ollama" | "claude" | "openai" (openai = stub)
+backend = "ollama"
+# Pass extra text along with ?? to the LLM (e.g. "?? why did this fail")
+allow_inline_context = true
+
+[llm.ollama]
+base_url = "http://localhost:11434"
+model = "llama3"
+timeout_seconds = 60
+# Number of retry attempts on connection error
+retries = 2
+
+[llm.claude]
+# API key — prefer setting ANTHROPIC_API_KEY env var instead
+api_key = ""
+model = "claude-opus-4-8"
+max_tokens = 1024
+
+[llm.openai]
+# Stub — not implemented yet
+api_key = ""
+model = "gpt-4o"
