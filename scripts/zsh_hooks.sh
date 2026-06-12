@@ -1,83 +1,80 @@
 #!/usr/bin/env zsh
-# scripts/zsh_hooks.sh
+# scripts/zsh_hooks.sh — TerminalGhost shell integration for zsh.
 #
-# Shell integration for zsh.
 # Source this file in your ~/.zshrc:
 #   source /path/to/terminalghost/scripts/zsh_hooks.sh
 #
 # What this installs:
-# ─────────────────────────────────────────────────────────────────────────────
+#   1. preexec hook — records the command text + start time before it runs.
+#   2. precmd hook  — after the command, sends {cmd, exit, cwd, duration, ts}
+#      to the daemon over TCP loopback (fire-and-forget, backgrounded so the
+#      prompt is never delayed; silently a no-op when the daemon is down).
+#   3. `??` function — runs `terminalghost ask`, which sends the query to the
+#      daemon and streams the LLM answer back to this terminal.
 #
-# 1. preexec hook  — called by zsh BEFORE each command executes.
-#    Captures: the raw command string typed by the user.
-#    Also records: current timestamp (start time for duration calc).
-#    Pseudocode:
-#      function _tg_preexec() {
-#        _TG_CMD="$1"                    # $1 is the command string
-#        _TG_START=$(date +%s%3N)        # milliseconds since epoch
-#      }
-#      add-zsh-hook preexec _tg_preexec
+# Configuration (export before sourcing):
+#   TG_HOST — daemon host, default 127.0.0.1
+#   TG_PORT — daemon port, default 48632
 #
-# 2. precmd hook  — called by zsh AFTER each command, just before the next
-#    prompt is displayed. At this point $? holds the exit code of the
-#    previous command.
-#    Captures: exit code, working directory, duration, and sends everything
-#    to the daemon over the Unix socket.
-#    Pseudocode:
-#      function _tg_precmd() {
-#        local exit_code=$?
-#        local end_ts=$(date +%s%3N)
-#        local duration=$(( end_ts - _TG_START ))
-#        local payload=$(printf '{"cmd":"%s","exit":%d,"cwd":"%s","duration":%d,"ts":%s}\n' \
-#          "$(echo $_TG_CMD | sed 's/"/\\"/g')" \
-#          "$exit_code" \
-#          "$(pwd)" \
-#          "$duration" \
-#          "$(date +%s.%N)")
-#        echo "$payload" | socat - UNIX-CONNECT:$_TG_SOCKET 2>/dev/null
-#        unset _TG_CMD _TG_START
-#      }
-#      add-zsh-hook precmd _tg_precmd
-#
-# 3. ?? function / alias — allows the user to type ?? at the prompt.
-#    The function sends the literal string "??" as a command through the
-#    normal preexec/precmd pipeline. The daemon's TriggerHandler detects it.
-#    Pseudocode:
-#      function ??() {
-#        local inline="${@}"
-#        local cmd="??"
-#        [[ -n "$inline" ]] && cmd="?? $inline"
-#        # Execute as a no-op so preexec/precmd fire with this command text.
-#        # Actually, zsh does NOT run preexec for shell functions directly;
-#        # we need to send directly to the socket here instead.
-#        local payload=$(printf '{"cmd":"%s","exit":0,"cwd":"%s","duration":0,"ts":%s}\n' \
-#          "$cmd" "$(pwd)" "$(date +%s.%N)")
-#        echo "$payload" | socat - UNIX-CONNECT:$_TG_SOCKET
-#      }
-#
-# Configuration:
-#   _TG_SOCKET — path to the daemon's Unix socket.
-#   Defaults to /tmp/terminalghost.sock; override before sourcing:
-#     export TG_SOCKET=/custom/path.sock
-#
-# Requirements:
-#   - `socat` must be installed (brew install socat / apt install socat)
-#   - OR replace socat with `nc -U $socket` on systems that support it
-#   - The terminalghost daemon must be running (`terminalghost start`)
-#
-# Notes:
-#   - preexec/precmd are zsh-specific. For bash, see bash_hooks.sh.
-#   - The hook silently does nothing if the socket is not available
-#     (2>/dev/null suppresses socat errors). This is intentional: the shell
-#     should never fail or slow down because the daemon is stopped.
-#   - Special characters in $_TG_CMD (quotes, backslashes, newlines) must be
-#     JSON-escaped before embedding in the payload. The pseudocode above uses
-#     a simplistic sed; a real implementation should use Python or jq for
-#     robust escaping.
-#   - Password-containing commands: the hook sends the full command string.
-#     Mitigation: the daemon's capture layer redacts lines matching password
-#     patterns. However, for extra safety, the hooks could be extended to
-#     strip commands matching a local blocklist before sending.
+# Requirements: python3 on PATH (used for robust JSON escaping + the TCP
+# send; avoids a socat/nc dependency), and a running daemon
+# (`terminalghost start`).
 
-# TODO: replace the pseudocode above with real shell implementation
-_TG_SOCKET="${TG_SOCKET:-/tmp/terminalghost.sock}"
+export TG_HOST="${TG_HOST:-127.0.0.1}"
+export TG_PORT="${TG_PORT:-48632}"
+
+zmodload zsh/datetime 2>/dev/null
+autoload -Uz add-zsh-hook
+
+# Send one command event to the daemon. Args: cmd exit_code cwd duration_ms
+# Runs python3 in a disowned background job so the shell never blocks.
+_tg_send_event() {
+  python3 - "$1" "$2" "$3" "$4" <<'PY' >/dev/null 2>&1 &!
+import json, os, socket, sys, time
+
+cmd, exit_code, cwd, duration = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+payload = json.dumps({
+    "cmd": cmd,
+    "exit": max(0, min(255, exit_code)),
+    "cwd": cwd,
+    "duration": max(0, duration),
+    "ts": time.time(),
+    "pid": os.getppid(),
+    "shell": "zsh",
+}) + "\n"
+try:
+    with socket.create_connection(
+        (os.environ.get("TG_HOST", "127.0.0.1"), int(os.environ.get("TG_PORT", "48632"))),
+        timeout=0.5,
+    ) as sock:
+        sock.sendall(payload.encode("utf-8"))
+except OSError:
+    pass  # daemon not running — never bother the shell about it
+PY
+}
+
+_tg_preexec() {
+  _TG_CMD="$1"
+  _TG_START="$EPOCHREALTIME"
+}
+
+_tg_precmd() {
+  local exit_code=$?
+  [[ -z "$_TG_CMD" ]] && return
+  local duration=0
+  if [[ -n "$_TG_START" && -n "$EPOCHREALTIME" ]]; then
+    duration=$(( (EPOCHREALTIME - _TG_START) * 1000 ))
+    duration=${duration%.*}
+  fi
+  _tg_send_event "$_TG_CMD" "$exit_code" "$PWD" "$duration"
+  unset _TG_CMD _TG_START
+}
+
+add-zsh-hook preexec _tg_preexec
+add-zsh-hook precmd _tg_precmd
+
+# `??` (optionally followed by extra context) — query TerminalGhost.
+# The ask client stays connected and streams the answer to this terminal.
+'??'() {
+  terminalghost ask "$@"
+}

@@ -2,4 +2,6 @@
 #
 # Re-exports the daemon entrypoint so `terminalghost start` works.
 
-# TODO: from terminalghost.daemon.process import main
+from terminalghost.daemon.process import main
+
+__all__ = ["main"]

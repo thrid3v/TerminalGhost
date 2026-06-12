@@ -28,6 +28,9 @@ terminalghost-*.db
 config.toml
 !config.example.toml
 
+# Claude Code
+CLAUDE.md
+
 # Editor
 .vscode/
 .idea/

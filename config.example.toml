@@ -7,10 +7,12 @@
 history_size = 200
 # Path to the SQLite database (~ expands to home dir)
 db_path = "~/.local/share/terminalghost/history.db"
-# Unix socket path the daemon listens on (shell hooks write here)
-socket_path = "/tmp/terminalghost.sock"
+# TCP loopback address the daemon listens on (shell hooks write here).
+# TCP is used instead of a Unix socket so the daemon also runs on Windows.
+host = "127.0.0.1"
+port = 48632
 # PID file location
-pid_file = "/tmp/terminalghost.pid"
+pid_file = "~/.local/share/terminalghost/terminalghost.pid"
 
 [capture]
 # Redact output lines that look like password prompts before storing

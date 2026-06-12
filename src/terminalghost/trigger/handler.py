@@ -1,122 +1,116 @@
 # terminalghost.trigger.handler
 #
-# Responsibility:
-#   Detects when the user types `??` (optionally followed by extra context)
-#   as a standalone shell command, then orchestrates the full query pipeline:
-#     capture detection → context assembly → LLM query → streamed output.
+# Detects the `??` trigger and orchestrates the full query pipeline:
+# trigger detection → context assembly → LLM query → streamed output.
 #
-#   This is the "main loop" of the user-facing feature. Everything else in
-#   the project exists to support this module.
-#
-# Key classes / functions to implement:
-#
-#   class TriggerHandler:
-#       """
-#       Listens for `??` commands delivered via the capture layer and runs
-#       the query pipeline when one is detected.
-#
-#       Args:
-#           db (Database): open database handle
-#           assembler (ContextAssembler): prompt builder
-#           backend (LLMBackend): configured LLM backend
-#           config (Config): for inline_context setting and output preferences
-#       """
-#
-#       async def handle(self, cmd: str, cwd: str) -> None:
-#           """
-#           Entry point called by the capture layer when a command event
-#           arrives. Checks whether `cmd` is a trigger; if so, runs the
-#           full pipeline. If not, returns immediately (no-op).
-#
-#           Pipeline steps:
-#             1. is_trigger(cmd) — guard; return early if False
-#             2. extract_inline_context(cmd) — parse optional text after ??
-#             3. backend.is_available() — fast pre-check; print error and
-#                return if backend is down (avoid assembling a big prompt
-#                only to fail at the HTTP call)
-#             4. assembler.assemble(cwd, inline_context)
-#             5. Print a header line to the terminal (e.g. "TerminalGhost ▶")
-#             6. backend.stream_query(prompt) — stream to terminal via Rich
-#             7. Print a trailing newline / separator
-#
-#           Args:
-#               cmd (str): the command text that was just executed
-#               cwd (str): the working directory at the time of the command
-#           """
-#           pass  # TODO: implement
-#
-#       def is_trigger(self, cmd: str) -> bool:
-#           """
-#           Return True if `cmd` should activate the query pipeline.
-#
-#           Rules:
-#             - Strip leading/trailing whitespace from cmd.
-#             - The trigger is the string "??" optionally followed by a
-#               space and arbitrary text: re.match(r'^\?\?(\s+.*)?$', cmd)
-#             - Must be False for:
-#                 "echo ??"          (part of a larger command — but note the
-#                                     shell hook would send "echo ??" as the
-#                                     full command text, so this actually
-#                                     depends on whether the hook sees the
-#                                     evaluated or literal command)
-#                 "" or "? ?"        (wrong spacing)
-#             - The PTY layer should only call this when a shell prompt is
-#               active (not inside a REPL or editor); the hook layer always
-#               sends complete commands so context is already correct.
-#
-#           Args:
-#               cmd (str): raw command text
-#           Returns:
-#               bool
-#           """
-#           pass  # TODO: implement
-#
-#       def extract_inline_context(self, cmd: str) -> str:
-#           """
-#           Extract the optional free-text portion after "??".
-#           E.g.: "?? why does make fail on ARM" → "why does make fail on ARM"
-#                 "??"                            → ""
-#
-#           Args:
-#               cmd (str): trigger command text
-#           Returns:
-#               str: the inline context portion (stripped), or ""
-#           """
-#           pass  # TODO: implement
-#
-#       async def _stream_to_terminal(
-#           self, stream: "AsyncIterator[str]"
-#       ) -> None:
-#           """
-#           Consume an async text stream and print each chunk to stdout using
-#           Rich's Live display or direct sys.stdout.write for low-latency
-#           streaming. Ensure the terminal is left in a clean state even if
-#           the user hits Ctrl-C mid-stream.
-#
-#           Args:
-#               stream: async iterator of text chunks from backend.stream_query
-#           """
-#           pass  # TODO: implement
-#
-# Edge cases:
-#   - Ctrl-C during streaming: catch KeyboardInterrupt / asyncio.CancelledError,
-#     print a newline, and return cleanly rather than printing a traceback.
-#   - Backend unavailable: print a friendly one-line error to stderr and
-#     return; do NOT crash the daemon.
-#   - "??" typed inside a running Python REPL or node session: the PTY layer
-#     should suppress triggers in this state (handled upstream); TriggerHandler
-#     itself just validates the command string.
-#   - Extremely long LLM response: no hard limit; streaming keeps memory low.
-#   - User types "??" as part of a shell script: the hook sends the evaluated
-#     command; "??" as a script token would not normally be sent by the hook.
-#   - Race condition: two "??" commands queued rapidly. Use an asyncio.Lock
-#     to prevent overlapping pipeline runs.
-#
-# Imports needed:
-#   import asyncio, re, sys, logging
-#   from rich.console import Console
-#   from terminalghost.storage.db import Database
-#   from terminalghost.context.assembler import ContextAssembler
-#   from terminalghost.llm.base import LLMBackend, LLMError
+# DESIGN NOTE (response channel): the daemon's stdout is detached from the
+# user's terminal, so output is delivered through an async `send` callback
+# supplied by the caller. For `??` queries arriving over the socket, the
+# HookReceiver passes a send() that writes back to the connected client
+# (the `terminalghost ask` process running in the user's terminal). When no
+# send is given (e.g. foreground/dev mode), output goes to this process's
+# stdout.
 
-# TODO: implement TriggerHandler class
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+import sys
+from typing import TYPE_CHECKING, AsyncIterator, Awaitable, Callable
+
+from terminalghost.llm.base import LLMError
+
+if TYPE_CHECKING:
+    from terminalghost.config.loader import Config
+    from terminalghost.context.assembler import ContextAssembler
+    from terminalghost.llm.base import LLMBackend
+    from terminalghost.storage.db import Database
+
+log = logging.getLogger(__name__)
+
+SendFn = Callable[[str], Awaitable[None]]
+
+TRIGGER_RE = re.compile(r"^\?\?(\s+.*)?$", re.DOTALL)
+
+HEADER = "TerminalGhost ▶\n\n"
+
+
+async def _stdout_send(text: str) -> None:
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
+
+class TriggerHandler:
+    """Runs the query pipeline when a `??` command is detected."""
+
+    def __init__(
+        self,
+        db: "Database",
+        assembler: "ContextAssembler",
+        backend: "LLMBackend",
+        config: "Config",
+    ) -> None:
+        self._db = db
+        self._assembler = assembler
+        self._backend = backend
+        self._config = config
+        # Serializes pipeline runs so two rapid ?? don't interleave output.
+        self._lock = asyncio.Lock()
+
+    def set_backend(self, backend: "LLMBackend") -> None:
+        """Swap the LLM backend (used by SIGHUP config hot-reload)."""
+        self._backend = backend
+
+    # -- trigger parsing -------------------------------------------------------
+
+    def is_trigger(self, cmd: str) -> bool:
+        """True for "??" or "?? <text>"; False for "echo ??", "??x", etc."""
+        return bool(TRIGGER_RE.match(cmd.strip()))
+
+    def extract_inline_context(self, cmd: str) -> str:
+        """Extract the optional free text after "??" (stripped)."""
+        if not self._config.llm.allow_inline_context:
+            return ""
+        stripped = cmd.strip()
+        if not stripped.startswith("??"):
+            return ""
+        return stripped[2:].strip()
+
+    # -- pipeline ----------------------------------------------------------------
+
+    async def handle(self, cmd: str, cwd: str, send: SendFn | None = None) -> None:
+        """Run the pipeline if `cmd` is a trigger; no-op otherwise."""
+        if not self.is_trigger(cmd):
+            return
+        emit = send or _stdout_send
+        inline_context = self.extract_inline_context(cmd)
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            # is_available() may block on a short HTTP probe — keep it off the loop.
+            available = await loop.run_in_executor(None, self._backend.is_available)
+            if not available:
+                await emit(
+                    "TerminalGhost: the LLM backend is not available."
+                    " Check that it is running/configured (see config.toml).\n"
+                )
+                return
+            prompt = self._assembler.assemble(cwd, inline_context)
+            await emit(HEADER)
+            try:
+                await self._stream_to(self._backend.stream_query(prompt), emit)
+                await emit("\n")
+            except LLMError as exc:
+                await emit(f"\nTerminalGhost error: {exc}\n")
+
+    async def _stream_to(self, stream: AsyncIterator[str], emit: SendFn) -> None:
+        """Consume the LLM stream, leaving the output clean on interrupt."""
+        try:
+            async for chunk in stream:
+                await emit(chunk)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            # Ctrl-C mid-stream: terminate the line, no traceback.
+            try:
+                await emit("\n[interrupted]\n")
+            except Exception:  # noqa: BLE001 — peer may already be gone
+                pass

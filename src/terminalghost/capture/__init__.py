@@ -12,5 +12,10 @@
 # What calls this:
 #   daemon.process imports both classes to set up capture on daemon start.
 
-# TODO: from terminalghost.capture.pty_capture import PTYCapture
-# TODO: from terminalghost.capture.shell_hooks import HookReceiver
+from terminalghost.capture.shell_hooks import HookReceiver
+
+# PTYCapture (deep capture path) is still a comments-only stub and Unix-only;
+# re-export it here once implemented:
+# from terminalghost.capture.pty_capture import PTYCapture
+
+__all__ = ["HookReceiver"]

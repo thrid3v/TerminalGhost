@@ -1,150 +1,227 @@
 # terminalghost.storage.db
 #
-# Responsibility:
-#   SQLite connection wrapper, CRUD operations, and rolling-buffer enforcement.
-#   This is the single module that touches the database file. All other
-#   modules interact with storage through this module's public API.
+# SQLite connection wrapper, CRUD operations, and rolling-buffer enforcement.
+# This is the single module that touches the database file.
 #
-# Key classes / functions to implement:
-#
-#   @dataclass
-#   class CommandEvent:
-#       """
-#       Immutable record of one shell command. Passed between the capture
-#       layer and the storage layer. Also returned by read queries.
-#
-#       Fields:
-#           id (int | None): database row ID; None before INSERT
-#           session_id (int): FK to sessions table
-#           ts (float): Unix timestamp
-#           cwd (str): working directory
-#           cmd (str): raw command text
-#           exit_code (int): shell exit code
-#           duration_ms (int): wall time in ms
-#           output (str | None): truncated output snippet
-#       """
-#       pass  # TODO: implement as dataclass
-#
-#   class Database:
-#       """
-#       Thin wrapper around sqlite3.Connection. Manages schema migrations,
-#       insert, query, and rolling-buffer pruning.
-#
-#       Args:
-#           path (str): absolute path to the .db file. Use ":memory:" for tests.
-#           history_size (int): max number of command rows to retain.
-#
-#       Thread safety:
-#           sqlite3 connections are not thread-safe by default. Either open
-#           one connection per thread (check_same_thread=False + WAL mode)
-#           or use a threading.Lock around every operation. WAL journal mode
-#           is strongly recommended to allow concurrent readers.
-#       """
-#
-#       def open(self) -> None:
-#           """
-#           Open (or create) the SQLite file, enable WAL mode, run any
-#           pending schema migrations, and record the current SCHEMA_VERSION.
-#
-#           Creates parent directories if they don't exist (e.g. first run).
-#           """
-#           pass  # TODO: implement
-#
-#       def close(self) -> None:
-#           """
-#           Flush WAL, checkpoint, and close the connection.
-#           Safe to call multiple times (idempotent).
-#           """
-#           pass  # TODO: implement
-#
-#       def insert_command(self, event: CommandEvent) -> int:
-#           """
-#           Insert one CommandEvent row and return its new row ID.
-#           Calls _prune() after every insert to enforce history_size.
-#
-#           Args:
-#               event (CommandEvent): the event to persist
-#           Returns:
-#               int: the assigned row ID
-#           """
-#           pass  # TODO: implement
-#
-#       def get_recent_commands(self, limit: int = 50) -> list[CommandEvent]:
-#           """
-#           Return the `limit` most recent commands ordered newest-first.
-#           Used by context.assembler to build the LLM prompt.
-#
-#           Args:
-#               limit (int): max rows to return (capped at history_size)
-#           Returns:
-#               list[CommandEvent]: ordered newest → oldest
-#           """
-#           pass  # TODO: implement
-#
-#       def get_last_error(self) -> CommandEvent | None:
-#           """
-#           Return the most recent command whose exit_code != 0, or None
-#           if all recent commands succeeded. Used by context.assembler to
-#           highlight the failing command.
-#
-#           Returns:
-#               CommandEvent | None
-#           """
-#           pass  # TODO: implement
-#
-#       def start_session(self, shell_pid: int, shell: str) -> int:
-#           """
-#           Insert a new sessions row and return its ID.
-#           Called when the daemon accepts a new shell hook connection.
-#
-#           Args:
-#               shell_pid (int): PID of the connecting shell process
-#               shell (str): shell name, e.g. "zsh"
-#           Returns:
-#               int: new session_id
-#           """
-#           pass  # TODO: implement
-#
-#       def end_session(self, session_id: int) -> None:
-#           """
-#           Set end_ts = now on the given session row.
-#           Called when the daemon detects a shell connection closed.
-#           """
-#           pass  # TODO: implement
-#
-#       def _prune(self) -> None:
-#           """
-#           Delete oldest rows so the total count stays <= history_size.
-#           Uses a DELETE WHERE id NOT IN (SELECT id ... ORDER BY ts DESC LIMIT N)
-#           pattern. Called internally after every insert — should be fast
-#           because the id index makes the subquery O(log n).
-#           """
-#           pass  # TODO: implement
-#
-#       def _run_migrations(self, conn: "sqlite3.Connection") -> None:
-#           """
-#           Read current schema version from the DB, compare to
-#           schema.SCHEMA_VERSION, and apply any needed migration SQL blocks
-#           from schema.get_migrations() in order within a transaction.
-#           """
-#           pass  # TODO: implement
-#
-# Edge cases:
-#   - DB file on a filesystem that doesn't support WAL (e.g. some NFS mounts):
-#     fall back to DELETE journal mode gracefully.
-#   - Concurrent writes from multiple shell sessions: WAL + write serialization
-#     via a threading.Lock is the simplest safe approach.
-#   - First-run: db_path parent directories may not exist; create them.
-#   - Disk full during INSERT: catch sqlite3.OperationalError and log a
-#     warning rather than crashing the daemon.
-#   - ":memory:" path for tests: skip parent-dir creation logic.
-#
-# Imports needed:
-#   import sqlite3, threading, os, logging
-#   from dataclasses import dataclass, field
-#   from terminalghost.storage.schema import (
-#       SCHEMA_VERSION, CREATE_COMMANDS_TABLE, CREATE_SESSIONS_TABLE,
-#       CREATE_VERSION_TABLE, INDEXES, get_migrations
-#   )
+# Thread safety: one connection with check_same_thread=False, WAL journal
+# mode where supported, and a threading.Lock serializing every operation.
+# Ordering and pruning use the monotonic AUTOINCREMENT id (not ts, which can
+# tie when two commands land in the same second).
 
-# TODO: implement CommandEvent dataclass and Database class
+from __future__ import annotations
+
+import logging
+import os
+import sqlite3
+import threading
+import time
+from dataclasses import dataclass
+
+from terminalghost.storage import schema
+
+log = logging.getLogger(__name__)
+
+# Application-layer truncation limits (TEXT columns are unbounded in SQLite).
+MAX_CMD_CHARS = 4096
+
+
+@dataclass
+class CommandEvent:
+    """Record of one shell command, passed between capture and storage."""
+
+    session_id: int
+    ts: float
+    cwd: str
+    cmd: str
+    exit_code: int
+    duration_ms: int
+    output: str | None = None
+    id: int | None = None  # database row ID; None before INSERT
+
+
+_COLUMNS = "id, session_id, ts, cwd, cmd, exit_code, duration_ms, output"
+
+
+def _row_to_event(row: sqlite3.Row | tuple) -> CommandEvent:
+    (row_id, session_id, ts, cwd, cmd, exit_code, duration_ms, output) = row
+    return CommandEvent(
+        session_id=session_id,
+        ts=ts,
+        cwd=cwd,
+        cmd=cmd,
+        exit_code=exit_code,
+        duration_ms=duration_ms,
+        output=output,
+        id=row_id,
+    )
+
+
+class Database:
+    """Thin wrapper around sqlite3.Connection with rolling-buffer pruning."""
+
+    def __init__(
+        self,
+        path: str,
+        history_size: int = 200,
+        max_output_bytes: int = 4096,
+    ) -> None:
+        self._path = path
+        self._history_size = history_size
+        self._max_output_bytes = max_output_bytes
+        self._conn: sqlite3.Connection | None = None
+        self._lock = threading.Lock()
+
+    # -- lifecycle -----------------------------------------------------------
+
+    def open(self) -> None:
+        """Open (or create) the SQLite file, enable WAL, run migrations."""
+        if self._conn is not None:
+            return  # idempotent
+        if self._path != ":memory:":
+            parent = os.path.dirname(os.path.abspath(self._path))
+            os.makedirs(parent, exist_ok=True)
+        conn = sqlite3.connect(self._path, check_same_thread=False)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError:
+            # e.g. some NFS mounts don't support WAL; DELETE mode still works
+            log.warning("WAL journal mode unavailable; falling back to DELETE")
+            conn.execute("PRAGMA journal_mode=DELETE")
+        conn.execute("PRAGMA foreign_keys=ON")
+        with conn:
+            conn.execute(schema.CREATE_VERSION_TABLE)
+            conn.execute(schema.CREATE_SESSIONS_TABLE)
+            conn.execute(schema.CREATE_COMMANDS_TABLE)
+            for index_sql in schema.INDEXES:
+                conn.execute(index_sql)
+            self._run_migrations(conn)
+        self._conn = conn
+
+    def close(self) -> None:
+        """Checkpoint WAL and close the connection. Idempotent."""
+        with self._lock:
+            if self._conn is None:
+                return
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.OperationalError:
+                pass  # not in WAL mode
+            self._conn.close()
+            self._conn = None
+
+    # -- commands ------------------------------------------------------------
+
+    def insert_command(self, event: CommandEvent) -> int:
+        """Insert one CommandEvent and return its row ID (-1 on write failure)."""
+        conn = self._require_conn()
+        cmd = event.cmd[:MAX_CMD_CHARS]
+        output = event.output[: self._max_output_bytes] if event.output else event.output
+        with self._lock:
+            try:
+                with conn:
+                    cursor = conn.execute(
+                        "INSERT INTO commands"
+                        " (session_id, ts, cwd, cmd, exit_code, duration_ms, output)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            event.session_id,
+                            event.ts,
+                            event.cwd,
+                            cmd,
+                            event.exit_code,
+                            event.duration_ms,
+                            output,
+                        ),
+                    )
+                    row_id = cursor.lastrowid
+                    self._prune(conn)
+                return int(row_id)
+            except sqlite3.OperationalError as exc:
+                # e.g. disk full — log rather than crashing the daemon
+                log.warning("failed to persist command event: %s", exc)
+                return -1
+
+    def get_recent_commands(self, limit: int = 50) -> list[CommandEvent]:
+        """Return the `limit` most recent commands, newest first."""
+        conn = self._require_conn()
+        limit = max(0, min(limit, self._history_size))
+        with self._lock:
+            rows = conn.execute(
+                f"SELECT {_COLUMNS} FROM commands ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [_row_to_event(row) for row in rows]
+
+    def get_last_error(self) -> CommandEvent | None:
+        """Return the most recent command with exit_code != 0, or None."""
+        conn = self._require_conn()
+        with self._lock:
+            row = conn.execute(
+                f"SELECT {_COLUMNS} FROM commands"
+                " WHERE exit_code != 0 ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        return _row_to_event(row) if row else None
+
+    # -- sessions ------------------------------------------------------------
+
+    def start_session(self, shell_pid: int, shell: str) -> int:
+        """Insert a new sessions row and return its ID."""
+        conn = self._require_conn()
+        with self._lock, conn:
+            cursor = conn.execute(
+                "INSERT INTO sessions (shell_pid, shell, start_ts) VALUES (?, ?, ?)",
+                (shell_pid, shell, time.time()),
+            )
+            return int(cursor.lastrowid)
+
+    def end_session(self, session_id: int) -> None:
+        """Set end_ts = now on the given session row."""
+        conn = self._require_conn()
+        with self._lock, conn:
+            conn.execute(
+                "UPDATE sessions SET end_ts = ? WHERE id = ?",
+                (time.time(), session_id),
+            )
+
+    # -- internals -----------------------------------------------------------
+
+    def _require_conn(self) -> sqlite3.Connection:
+        if self._conn is None:
+            raise RuntimeError("Database is not open; call open() first")
+        return self._conn
+
+    def _prune(self, conn: sqlite3.Connection) -> None:
+        """Delete oldest rows so the total count stays <= history_size.
+
+        Called inside insert_command's transaction (lock already held).
+        """
+        conn.execute(
+            "DELETE FROM commands WHERE id NOT IN"
+            " (SELECT id FROM commands ORDER BY id DESC LIMIT ?)",
+            (self._history_size,),
+        )
+
+    def _run_migrations(self, conn: sqlite3.Connection) -> None:
+        """Bring the schema_version up to schema.SCHEMA_VERSION."""
+        row = conn.execute("SELECT version FROM schema_version").fetchone()
+        if row is None:
+            # Fresh database: tables were just created at the current schema.
+            conn.execute(
+                "INSERT INTO schema_version (version) VALUES (?)",
+                (schema.SCHEMA_VERSION,),
+            )
+            return
+        current = int(row[0])
+        if current > schema.SCHEMA_VERSION:
+            raise RuntimeError(
+                f"database schema version {current} is newer than this build"
+                f" ({schema.SCHEMA_VERSION}); upgrade terminalghost"
+            )
+        if current == schema.SCHEMA_VERSION:
+            return
+        migrations = schema.get_migrations()
+        for version in range(current + 1, schema.SCHEMA_VERSION + 1):
+            for statement in migrations.get(version, []):
+                conn.execute(statement)
+            log.info("migrated database schema to version %d", version)
+        conn.execute("UPDATE schema_version SET version = ?", (schema.SCHEMA_VERSION,))

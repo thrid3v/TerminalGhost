@@ -2,4 +2,6 @@
 #
 # Re-exports the public interface.
 
-# TODO: from terminalghost.config.loader import Config, load_config
+from terminalghost.config.loader import Config, ConfigError, load_config
+
+__all__ = ["Config", "ConfigError", "load_config"]

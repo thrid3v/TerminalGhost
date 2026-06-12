@@ -11,5 +11,7 @@
 #   daemon.process opens the DB on start and passes the handle to capture + trigger.
 #   context.assembler reads from the DB to assemble the LLM prompt.
 
-# TODO: from terminalghost.storage.db import Database, CommandEvent
-# TODO: from terminalghost.storage.schema import SCHEMA_VERSION
+from terminalghost.storage.db import CommandEvent, Database
+from terminalghost.storage.schema import SCHEMA_VERSION
+
+__all__ = ["CommandEvent", "Database", "SCHEMA_VERSION"]

@@ -1,123 +1,163 @@
 # terminalghost.llm.backends.ollama
 #
-# Responsibility:
-#   Concrete LLMBackend implementation for the Ollama local HTTP API.
-#   Talks to http://localhost:11434 (or a configured URL) using httpx.
-#   This is the default backend — no API key required, fully offline.
-#
-# Ollama API reference (relevant endpoints):
-#   POST /api/generate   — non-streaming and streaming generation
-#   GET  /api/tags       — list available models (used by is_available)
-#   The API returns newline-delimited JSON objects when streaming=True.
-#
-# Key classes / functions to implement:
-#
-#   class OllamaBackend(LLMBackend):
-#       """
-#       LLM backend that sends prompts to a locally running Ollama instance.
-#
-#       Args:
-#           base_url (str): Ollama server URL, default "http://localhost:11434"
-#           model (str): model tag to use, e.g. "llama3", "mistral", "codellama"
-#           timeout (float): request timeout in seconds
-#           retries (int): number of retry attempts on connection error
-#       """
-#
-#       async def query(self, prompt: str) -> str:
-#           """
-#           POST /api/generate with stream=False.
-#           Parse the "response" field from the single JSON response object.
-#
-#           Args:
-#               prompt (str): assembled context prompt
-#           Returns:
-#               str: model response text
-#           Raises:
-#               LLMConnectionError: if httpx.ConnectError or connection refused
-#               LLMTimeoutError: if httpx.TimeoutException
-#               LLMResponseError: if HTTP status != 200 or JSON malformed
-#           """
-#           pass  # TODO: implement
-#
-#       async def stream_query(self, prompt: str) -> "AsyncIterator[str]":
-#           """
-#           POST /api/generate with stream=True.
-#           The response body is a series of newline-delimited JSON objects:
-#             {"model":"llama3","response":"Hello","done":false}
-#             {"model":"llama3","response":"!","done":true,"...":"..."}
-#           Yield the "response" field from each object until "done" is True.
-#
-#           Args:
-#               prompt (str): assembled context prompt
-#           Yields:
-#               str: each incremental text chunk
-#           Raises:
-#               LLMConnectionError, LLMTimeoutError, LLMResponseError
-#           """
-#           pass  # TODO: implement
-#
-#       def is_available(self) -> bool:
-#           """
-#           Synchronous check: GET /api/tags with a short timeout (1s).
-#           Returns True if Ollama is running and the configured model exists
-#           in the response. Returns False on any error.
-#
-#           Note: uses httpx.get() (sync) to avoid requiring an event loop
-#           at check time. This is intentionally a fast, cheap probe.
-#           """
-#           pass  # TODO: implement
-#
-#       def _build_request_body(self, prompt: str, stream: bool) -> dict:
-#           """
-#           Construct the JSON body for /api/generate.
-#
-#           Args:
-#               prompt (str): the prompt text
-#               stream (bool): whether to enable streaming
-#           Returns:
-#               dict: request body with model, prompt, stream fields
-#           """
-#           pass  # TODO: implement
-#
-#       def _handle_http_error(self, response: "httpx.Response") -> None:
-#           """
-#           Inspect a non-200 response and raise the appropriate LLMError.
-#           Common Ollama error cases:
-#             404: model not found → LLMResponseError with helpful message
-#             500: Ollama internal error → LLMResponseError
-#           """
-#           pass  # TODO: implement
-#
-#       def _with_retry(self, coro_factory) -> "Awaitable":
-#           """
-#           Retry helper: call coro_factory() up to self.retries times,
-#           catching LLMConnectionError between attempts with exponential
-#           backoff (0.5s, 1s, ...). Re-raises on final failure.
-#
-#           Args:
-#               coro_factory: zero-arg callable returning an awaitable
-#           Returns:
-#               Awaitable: the result of the first successful attempt
-#           """
-#           pass  # TODO: implement
-#
-# Edge cases:
-#   - Ollama not running: ConnectError should produce a friendly message
-#     like "Ollama is not running. Start it with: ollama serve" rather than
-#     a raw stack trace.
-#   - Model not pulled: 404 from /api/generate should suggest
-#     `ollama pull <model>`.
-#   - Streaming partial JSON: a single iter chunk may contain multiple JSON
-#     objects or a split object. Buffer incomplete lines across iterations.
-#   - Very long responses: no hard limit, but the terminal output is streamed
-#     so memory is bounded by the streaming chunk size.
-#   - Context length exceeded: Ollama returns a 400 with a specific error;
-#     catch and raise LLMResponseError with the token count details.
-#   - Ollama may be running on a non-default port; always use config.base_url.
-#
-# Imports needed:
-#   import json, asyncio, logging
-#   import httpx
-#   from terminalghost.llm.base import LLMBackend, LLMConnectionError, LLMTimeoutError, LLMResponseError
+# Concrete LLMBackend for the Ollama local HTTP API (default backend —
+# no API key, fully offline). Endpoints used:
+#   POST /api/generate  — generation (stream and non-stream)
+#   GET  /api/tags      — model listing (used by is_available)
 
-# TODO: implement OllamaBackend class
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from typing import AsyncIterator, Awaitable, Callable
+
+import httpx
+
+from terminalghost.llm.base import (
+    LLMBackend,
+    LLMConnectionError,
+    LLMResponseError,
+    LLMTimeoutError,
+)
+
+log = logging.getLogger(__name__)
+
+_NOT_RUNNING_MSG = "Ollama is not running. Start it with: ollama serve"
+
+
+class OllamaBackend(LLMBackend):
+    """LLM backend talking to a locally running Ollama instance."""
+
+    def __init__(
+        self,
+        base_url: str = "http://localhost:11434",
+        model: str = "llama3",
+        timeout: float = 60.0,
+        retries: int = 2,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._model = model
+        self._timeout = timeout
+        self._retries = max(0, retries)
+        # Injectable transport so tests can use httpx.MockTransport.
+        self._transport = transport
+
+    # -- public API ----------------------------------------------------------
+
+    async def query(self, prompt: str) -> str:
+        body = self._build_request_body(prompt, stream=False)
+
+        async def attempt() -> str:
+            try:
+                async with self._client() as client:
+                    response = await client.post("/api/generate", json=body)
+            except httpx.TimeoutException as exc:
+                raise LLMTimeoutError(
+                    f"Ollama request timed out after {self._timeout}s"
+                ) from exc
+            except httpx.ConnectError as exc:
+                raise LLMConnectionError(_NOT_RUNNING_MSG) from exc
+            if response.status_code != 200:
+                self._handle_http_error(response)
+            try:
+                return response.json()["response"]
+            except (json.JSONDecodeError, KeyError, ValueError) as exc:
+                raise LLMResponseError(f"malformed Ollama response: {exc}") from exc
+
+        return await self._with_retry(attempt)
+
+    async def stream_query(self, prompt: str) -> AsyncIterator[str]:
+        body = self._build_request_body(prompt, stream=True)
+        attempt = 0
+        yielded = False
+        while True:
+            try:
+                async with self._client() as client:
+                    async with client.stream("POST", "/api/generate", json=body) as response:
+                        if response.status_code != 200:
+                            await response.aread()
+                            self._handle_http_error(response)
+                        buffer = ""
+                        async for chunk in response.aiter_text():
+                            buffer += chunk
+                            # A chunk may contain several JSON lines or a split one;
+                            # only complete (newline-terminated) lines are parsed.
+                            while "\n" in buffer:
+                                line, buffer = buffer.split("\n", 1)
+                                if not line.strip():
+                                    continue
+                                try:
+                                    obj = json.loads(line)
+                                except json.JSONDecodeError as exc:
+                                    raise LLMResponseError(
+                                        f"malformed Ollama stream line: {exc}"
+                                    ) from exc
+                                piece = obj.get("response", "")
+                                if piece:
+                                    yielded = True
+                                    yield piece
+                                if obj.get("done"):
+                                    return
+                return
+            except httpx.TimeoutException as exc:
+                raise LLMTimeoutError(
+                    f"Ollama request timed out after {self._timeout}s"
+                ) from exc
+            except httpx.ConnectError as exc:
+                # Never retry mid-stream — that would duplicate output.
+                attempt += 1
+                if yielded or attempt > self._retries:
+                    raise LLMConnectionError(_NOT_RUNNING_MSG) from exc
+                await asyncio.sleep(0.5 * 2 ** (attempt - 1))
+
+    def is_available(self) -> bool:
+        """Fast sync probe: server up AND the configured model is pulled."""
+        try:
+            response = httpx.get(f"{self._base_url}/api/tags", timeout=1.0)
+            if response.status_code != 200:
+                return False
+            names = [m.get("name", "") for m in response.json().get("models", [])]
+        except Exception:  # noqa: BLE001 — any failure means "not available"
+            return False
+        return any(
+            name == self._model or name.split(":", 1)[0] == self._model
+            for name in names
+        )
+
+    # -- internals -----------------------------------------------------------
+
+    def _client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            base_url=self._base_url,
+            timeout=self._timeout,
+            transport=self._transport,
+        )
+
+    def _build_request_body(self, prompt: str, stream: bool) -> dict:
+        return {"model": self._model, "prompt": prompt, "stream": stream}
+
+    def _handle_http_error(self, response: httpx.Response) -> None:
+        if response.status_code == 404:
+            raise LLMResponseError(
+                f"model {self._model!r} not found. Pull it with: ollama pull {self._model}"
+            )
+        detail = ""
+        try:
+            detail = response.json().get("error", "")
+        except (json.JSONDecodeError, ValueError):
+            detail = response.text[:200]
+        raise LLMResponseError(
+            f"Ollama returned HTTP {response.status_code}: {detail or 'unknown error'}"
+        )
+
+    async def _with_retry(self, coro_factory: Callable[[], Awaitable]):
+        """Retry on connection errors with exponential backoff (0.5s, 1s, ...)."""
+        for attempt in range(self._retries + 1):
+            try:
+                return await coro_factory()
+            except LLMConnectionError:
+                if attempt == self._retries:
+                    raise
+                await asyncio.sleep(0.5 * 2**attempt)

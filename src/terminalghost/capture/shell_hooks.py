@@ -1,107 +1,209 @@
 # terminalghost.capture.shell_hooks
 #
-# Responsibility:
-#   Receive structured command-event data from the shell hook scripts
-#   (scripts/zsh_hooks.sh, scripts/bash_hooks.sh) over a Unix domain socket.
-#   This is the "lightweight capture" path — the shell hooks are responsible
-#   for collecting command text, exit code, CWD, and timing; this module just
-#   receives and persists that data.
+# Receives structured command-event data from the shell hook scripts over a
+# TCP loopback socket (cross-platform replacement for the original Unix
+# domain socket design). This is the "lightweight capture" path.
 #
-# Protocol:
-#   Each hook sends a single newline-terminated JSON object per command:
-#     {
-#       "cmd":      "make build",
-#       "exit":     1,
-#       "cwd":      "/home/user/project",
-#       "duration": 4231,          # milliseconds
-#       "ts":       1718000000.123 # Unix timestamp float
-#     }
-#   The socket is a SOCK_STREAM Unix domain socket at config.general.socket_path.
-#   Multiple shell sessions can connect simultaneously.
+# Protocol (newline-terminated JSON, one object per line):
 #
-# Key classes / functions to implement:
+#   Command event (fire-and-forget; connection may close immediately after):
+#     {"cmd": "make build", "exit": 1, "cwd": "/home/u/p",
+#      "duration": 4231, "ts": 1718000000.123,
+#      "pid": 12345, "shell": "zsh"}          # pid/shell optional
 #
-#   class HookReceiver:
-#       """
-#       Async Unix-socket server that accepts connections from shell hook
-#       scripts and deserializes incoming CommandEvent records.
+#   Query (request/response; `terminalghost ask` stays connected and the
+#   daemon streams the answer back as raw UTF-8 text until it closes):
+#     {"type": "query", "cmd": "?? why did make fail", "cwd": "/home/u/p"}
 #
-#       Args:
-#           socket_path (str): Path to the Unix domain socket file.
-#           on_event (Callable[[CommandEvent], Awaitable[None]]): async
-#               callback fired for each complete, validated event received.
-#           config (Config): for validation limits (max_output_bytes, etc.)
-#
-#       Notes:
-#           - Must handle multiple concurrent connections (one per shell session).
-#           - A partial JSON payload across two TCP segments must be buffered
-#             until the newline delimiter arrives.
-#           - On daemon shutdown the socket file must be unlinked.
-#       """
-#
-#       async def start(self) -> None:
-#           """
-#           Bind and listen on socket_path, accept connections in a loop.
-#           This is an asyncio coroutine; run it with asyncio.create_task().
-#           Remove a stale socket file (from a previous crashed daemon) before
-#           binding if it already exists.
-#           """
-#           pass  # TODO: implement
-#
-#       async def stop(self) -> None:
-#           """
-#           Stop accepting new connections, close active connections, unlink
-#           the socket file.
-#           """
-#           pass  # TODO: implement
-#
-#       async def _handle_connection(
-#           self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-#       ) -> None:
-#           """
-#           Read newline-delimited JSON from one connected shell session.
-#           Validate each payload, convert to CommandEvent, call on_event.
-#           Log and skip malformed packets rather than crashing.
-#
-#           Args:
-#               reader: asyncio stream reader for this connection
-#               writer: asyncio stream writer (used only to close cleanly)
-#           """
-#           pass  # TODO: implement
-#
-#       def _parse_payload(self, raw: str) -> "CommandEvent":
-#           """
-#           Parse and validate a raw JSON string into a CommandEvent.
-#
-#           Args:
-#               raw (str): single JSON line from the socket
-#           Returns:
-#               CommandEvent: validated dataclass
-#           Raises:
-#               ValueError: if required fields are missing or types are wrong
-#
-#           Validation rules:
-#             - "cmd" must be a non-empty string
-#             - "exit" must be an int 0-255
-#             - "cwd" must be a non-empty string
-#             - "duration" must be a non-negative int (ms)
-#             - "ts" must be a positive float
-#             - "cmd" length capped at 4096 chars to prevent abuse
-#           """
-#           pass  # TODO: implement
-#
-# Edge cases:
-#   - Socket file left over from a crashed daemon: remove it before bind().
-#   - Shell sends an empty line / keep-alive: ignore silently.
-#   - Connection closed mid-payload (shell killed): discard the partial buffer.
-#   - Very long commands (heredocs, etc.): cap at 4096 bytes before storing.
-#   - The trigger word "??" will arrive as a command too; let the trigger
-#     module handle it — the hook receiver just stores it like any other cmd.
-#   - On macOS, Unix socket paths have a 104-byte limit; validate path length.
-#
-# Imports needed:
-#   import asyncio, json, os, logging
-#   from terminalghost.storage.db import CommandEvent
-#   from terminalghost.config.loader import Config
+# An object without "type" (or with "type": "command") is a command event.
 
-# TODO: implement HookReceiver class
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from typing import Awaitable, Callable
+
+from terminalghost.storage.db import CommandEvent
+
+log = logging.getLogger(__name__)
+
+MAX_CMD_CHARS = 4096
+_READ_LIMIT = 256 * 1024  # max bytes per JSON line
+
+# on_event(event, shell_pid, shell) — persist a command event
+OnEvent = Callable[[CommandEvent, int | None, str | None], Awaitable[None]]
+# on_query(cmd, cwd, send) — run the ?? pipeline, writing chunks via send
+OnQuery = Callable[[str, str, Callable[[str], Awaitable[None]]], Awaitable[None]]
+
+
+class HookReceiver:
+    """Async TCP server receiving events/queries from shell integrations."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        on_event: OnEvent,
+        on_query: OnQuery | None = None,
+    ) -> None:
+        self._host = host
+        self._port = port
+        self._on_event = on_event
+        self._on_query = on_query
+        self._server: asyncio.Server | None = None
+
+    @property
+    def port(self) -> int:
+        """The actually bound port (useful when constructed with port=0)."""
+        if self._server is None:
+            return self._port
+        return self._server.sockets[0].getsockname()[1]
+
+    async def start(self) -> None:
+        """Bind and start accepting connections."""
+        self._server = await asyncio.start_server(
+            self._handle_connection, self._host, self._port, limit=_READ_LIMIT
+        )
+        log.info("hook receiver listening on %s:%d", self._host, self.port)
+
+    async def stop(self) -> None:
+        """Stop accepting connections and close the server. Idempotent."""
+        if self._server is None:
+            return
+        self._server.close()
+        await self._server.wait_closed()
+        self._server = None
+
+    # -- connection handling -----------------------------------------------------
+
+    async def _handle_connection(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        """Read newline-delimited JSON lines from one client until EOF.
+
+        Malformed packets are logged and skipped, never fatal. A connection
+        closed mid-line simply discards the partial buffer (readline returns
+        the partial data without a trailing newline; we ignore it).
+        """
+        try:
+            while True:
+                try:
+                    line = await reader.readline()
+                except (asyncio.LimitOverrunError, ValueError):
+                    log.warning("oversized payload line; dropping connection")
+                    break
+                if not line:
+                    break  # EOF
+                if not line.endswith(b"\n") and reader.at_eof():
+                    # partial line then disconnect — discard
+                    break
+                text = line.decode("utf-8", errors="replace").strip()
+                if not text:
+                    continue  # keep-alive / empty line
+                try:
+                    obj = json.loads(text)
+                except json.JSONDecodeError:
+                    log.warning("malformed JSON payload: %.120s", text)
+                    continue
+                if not isinstance(obj, dict):
+                    log.warning("payload is not a JSON object: %.120s", text)
+                    continue
+
+                if obj.get("type") == "query":
+                    await self._handle_query(obj, writer)
+                    break  # one query per connection; close after responding
+                try:
+                    event, shell_pid, shell = self._parse_payload(text)
+                except ValueError as exc:
+                    log.warning("invalid command event (%s): %.120s", exc, text)
+                    continue
+                await self._on_event(event, shell_pid, shell)
+        except ConnectionError:
+            pass  # client vanished; nothing to do
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except (ConnectionError, OSError):
+                pass
+
+    async def _handle_query(self, obj: dict, writer: asyncio.StreamWriter) -> None:
+        """Run the ?? pipeline, streaming the answer back to this client."""
+        cmd = obj.get("cmd")
+        cwd = obj.get("cwd")
+        if not isinstance(cmd, str) or not cmd or not isinstance(cwd, str) or not cwd:
+            log.warning("invalid query payload: %r", obj)
+            return
+        if self._on_query is None:
+            return
+
+        async def send(text: str) -> None:
+            writer.write(text.encode("utf-8", errors="replace"))
+            await writer.drain()
+
+        try:
+            await self._on_query(cmd[:MAX_CMD_CHARS], cwd, send)
+        except ConnectionError:
+            log.info("query client disconnected mid-response")
+
+    # -- payload parsing -----------------------------------------------------------
+
+    def _parse_payload(self, raw: str) -> tuple[CommandEvent, int | None, str | None]:
+        """Parse and validate one JSON line into a CommandEvent.
+
+        Returns (event, shell_pid, shell); session_id is 0 — the daemon
+        resolves the real session from shell_pid. Raises ValueError on any
+        missing/mistyped field.
+        """
+        obj = json.loads(raw)
+        if not isinstance(obj, dict):
+            raise ValueError("payload must be a JSON object")
+
+        cmd = obj.get("cmd")
+        if not isinstance(cmd, str) or not cmd:
+            raise ValueError("cmd must be a non-empty string")
+        cmd = cmd[:MAX_CMD_CHARS]
+
+        exit_code = obj.get("exit")
+        if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+            raise ValueError("exit must be an integer")
+        if not 0 <= exit_code <= 255:
+            raise ValueError("exit must be in [0, 255]")
+
+        cwd = obj.get("cwd")
+        if not isinstance(cwd, str) or not cwd:
+            raise ValueError("cwd must be a non-empty string")
+
+        duration = obj.get("duration")
+        if isinstance(duration, bool) or not isinstance(duration, int) or duration < 0:
+            raise ValueError("duration must be a non-negative integer (ms)")
+
+        ts = obj.get("ts")
+        if isinstance(ts, bool) or not isinstance(ts, (int, float)) or ts <= 0:
+            raise ValueError("ts must be a positive number")
+
+        shell_pid = obj.get("pid")
+        if shell_pid is not None and (
+            isinstance(shell_pid, bool) or not isinstance(shell_pid, int)
+        ):
+            raise ValueError("pid must be an integer when present")
+
+        shell = obj.get("shell")
+        if shell is not None and not isinstance(shell, str):
+            raise ValueError("shell must be a string when present")
+
+        output = obj.get("output")
+        if output is not None and not isinstance(output, str):
+            raise ValueError("output must be a string when present")
+
+        event = CommandEvent(
+            session_id=0,  # resolved by the daemon from shell_pid
+            ts=float(ts),
+            cwd=cwd,
+            cmd=cmd,
+            exit_code=exit_code,
+            duration_ms=duration,
+            output=output,
+        )
+        return event, shell_pid, shell

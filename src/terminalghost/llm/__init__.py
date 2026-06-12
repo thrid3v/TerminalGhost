@@ -9,4 +9,20 @@
 #     backend = get_backend(config)
 #     response = await backend.query(prompt)
 
-# TODO: from terminalghost.llm.base import LLMBackend, get_backend
+from terminalghost.llm.base import (
+    LLMBackend,
+    LLMConnectionError,
+    LLMError,
+    LLMResponseError,
+    LLMTimeoutError,
+    get_backend,
+)
+
+__all__ = [
+    "LLMBackend",
+    "LLMConnectionError",
+    "LLMError",
+    "LLMResponseError",
+    "LLMTimeoutError",
+    "get_backend",
+]
