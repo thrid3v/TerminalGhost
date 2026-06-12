@@ -360,6 +360,12 @@ def _cmd_ask(config: Config, text: str) -> int:
     This is the client end of the response channel: it runs in the user's
     terminal, so writing to its stdout is what makes the answer visible.
     """
+    # Windows consoles may default to a legacy codepage (cp1252) that cannot
+    # encode characters the LLM (or our header) emits; force UTF-8 output.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass  # non-reconfigurable stream (e.g. pipe wrapper) — best effort
     cmd = "??" if not text else f"?? {text}"
     payload = json.dumps({"type": "query", "cmd": cmd, "cwd": os.getcwd()}) + "\n"
     try:

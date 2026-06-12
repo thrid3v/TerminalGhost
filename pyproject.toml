@@ -8,23 +8,17 @@ version = "0.1.0"
 description = "Local-first terminal-resident AI assistant that watches your shell and answers ?? queries"
 requires-python = ">=3.11"
 dependencies = [
-    # Async HTTP client — used by the Ollama backend and cloud backends
+    # Async HTTP client — used by the Ollama backend
     "httpx>=0.27",
-    # Anthropic Python SDK — used by the Claude cloud backend stub
+    # Anthropic Python SDK — used by the Claude cloud backend (imported lazily)
     "anthropic>=0.30",
-    # TOML writer (tomllib in stdlib is read-only)
-    "tomli-w>=1.0",
-    # Rich terminal output — streaming LLM responses, formatted suggestions
-    "rich>=13.0",
-    # Process & system utilities — daemon PID management, process tree inspection
+    # Process utilities — daemon PID management (start/stop/status)
     "psutil>=6.0",
-    # ptyprocess — cross-platform PTY spawning helper (Unix only at runtime)
-    "ptyprocess>=0.7",
-    # watchdog — optional config hot-reload; file-system event monitoring
-    "watchdog>=4.0",
 ]
 
 [project.optional-dependencies]
+# Only needed for the (not yet implemented) Unix-only PTY deep-capture path.
+pty = ["ptyprocess>=0.7"]
 dev = [
     "pytest>=8.2",
     "pytest-asyncio>=0.23",

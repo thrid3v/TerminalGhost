@@ -21,32 +21,106 @@ process, watches your shell commands, and answers `??` with a contextual suggest
    backend (Ollama by default; Claude as the cloud alternative) and streams the
    response back over the same connection into your terminal.
 
-## Quick start
+## Installation
+
+### 1. Prerequisites
+
+- **Python 3.11+** — `python --version` to check
+- **Git** (to clone the repo)
+
+### 2. Install TerminalGhost
 
 ```bash
-# 1. Create a venv and install
-python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -e ".[dev]"
+git clone https://github.com/thrid3v/TerminalGhost.git
+cd TerminalGhost
 
-# 2. (Optional) copy and edit config — defaults work out of the box
+# Linux / macOS
+python -m venv .venv && source .venv/bin/activate
+pip install -e .
+
+# Windows (PowerShell)
+python -m venv .venv; .\.venv\Scripts\Activate.ps1
+pip install -e .
+```
+
+(Add `".[dev]"` instead of `.` if you want to run the test suite.)
+
+### 3. Install an LLM backend
+
+**Option A — Ollama (default: free, fully local, no API key)**
+
+```bash
+# Windows
+winget install Ollama.Ollama
+
+# macOS
+brew install ollama
+
+# Linux
+curl -fsSL https://ollama.com/install.sh | sh
+```
+
+Then start the server and pull a model:
+
+```bash
+ollama serve          # skip if the Ollama app/service is already running
+ollama pull llama3.2  # small + fast (~2 GB); good for trying it out
+```
+
+Larger models give better answers — `ollama pull llama3` (~4.7 GB) — just match
+the `model` value in your config (step 4).
+
+**Option B — Claude (cloud, needs an Anthropic API key)**
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...   # PowerShell: $env:ANTHROPIC_API_KEY="sk-ant-..."
+```
+
+and set `backend = "claude"` in your config (step 4).
+
+### 4. Configure (optional)
+
+Defaults work out of the box with Ollama + `llama3`. To customize:
+
+```bash
 mkdir -p ~/.config/terminalghost
 cp config.example.toml ~/.config/terminalghost/config.toml
+```
 
-# 3. Source the shell integration
-echo 'source /path/to/terminalghost/scripts/zsh_hooks.sh' >> ~/.zshrc    # zsh
-echo 'source /path/to/terminalghost/scripts/bash_hooks.sh' >> ~/.bashrc  # bash
-# PowerShell: add to $PROFILE:
-#   . C:\path\to\terminalghost\scripts\powershell_hooks.ps1
+Edit `[llm]` `backend`, and `[llm.ollama]` `model` to match what you pulled
+(e.g. `llama3.2`).
 
-# 4. Start the daemon
-terminalghost start
+### 5. Hook up your shell
 
-# 5. Use it
-cd /some/project && make build   # → exit 1
-??                               # → streamed suggestion from your local LLM
+```bash
+# zsh — add to ~/.zshrc:
+source /path/to/TerminalGhost/scripts/zsh_hooks.sh
+
+# bash — add to ~/.bashrc:
+source /path/to/TerminalGhost/scripts/bash_hooks.sh
+```
+
+```powershell
+# PowerShell — add to $PROFILE (notepad $PROFILE):
+$env:Path = "C:\path\to\TerminalGhost\.venv\Scripts;$env:Path"
+. C:\path\to\TerminalGhost\scripts\powershell_hooks.ps1
 ```
 
 See `scripts/shell_integration.md` for details and troubleshooting.
+
+### 6. Start and use
+
+```bash
+terminalghost start
+
+cd /some/project && make build   # → exit 1
+??                               # → streamed suggestion from your local LLM
+?? give me the exact fix         # inline context works too
+```
+
+On PowerShell 7+ use `qq` instead of `??` (which is the null-coalescing operator
+there); Windows PowerShell 5.1 supports both. The first `??` after a cold start
+takes a few extra seconds while Ollama loads the model into memory.
 
 ## CLI
 
@@ -71,7 +145,7 @@ terminalghost ask [..]  # send a ?? query directly (what the ?? function calls)
 | `daemon` | Background process, socket server, PID management, CLI |
 | `config` | TOML loader, frozen Config dataclasses, TG_* env overrides |
 
-## Configuration
+## Configuration reference
 
 Config lives at `~/.config/terminalghost/config.toml` (see `config.example.toml`).
 Every key can be overridden with a `TG_SECTION__KEY` environment variable, e.g.
@@ -79,6 +153,14 @@ Every key can be overridden with a `TG_SECTION__KEY` environment variable, e.g.
 
 For the Claude backend, set `ANTHROPIC_API_KEY` in your environment (preferred
 over putting the key in the config file).
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+pytest                  # run the test suite
+ruff check src tests    # lint
+```
 
 ## Requirements
 
