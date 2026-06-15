@@ -91,7 +91,9 @@ class TriggerHandler:
 
     # -- pipeline ----------------------------------------------------------------
 
-    async def handle(self, cmd: str, cwd: str, send: SendFn | None = None) -> None:
+    async def handle(
+        self, cmd: str, cwd: str, send: SendFn | None = None, pasted: str | None = None
+    ) -> None:
         """Run the pipeline if `cmd` is a trigger; no-op otherwise.
 
         Decoration (the header/footer) is a presentation concern: when streaming
@@ -105,6 +107,12 @@ class TriggerHandler:
         emit = send or _stdout_send
         raw_inline = self.extract_inline_context(cmd)
         intent, inline_context = self._split_intent(raw_inline)
+        # Bare `qq` with nothing to work with → a helpful tip, not a vague answer.
+        if not raw_inline and self._is_empty_context(cwd):
+            if decorate:
+                await emit(HEADER)
+            await emit(self._EMPTY_TIP)
+            return
         async with self._lock:
             loop = asyncio.get_running_loop()
             # is_available() may block on a short HTTP probe — keep it off the loop.
@@ -117,7 +125,7 @@ class TriggerHandler:
                 return
             prior = self._recent_exchange()
             prompt = self._assembler.assemble(
-                cwd, inline_context, intent=intent, prior_exchange=prior
+                cwd, inline_context, intent=intent, prior_exchange=prior, pasted=pasted
             )
             if decorate:
                 await emit(HEADER)
@@ -161,6 +169,14 @@ class TriggerHandler:
 
     # -- conversational follow-ups ---------------------------------------------
 
+    _EMPTY_TIP = (
+        "**Nothing to fix here yet.** Run something first, then ask. Meanwhile:\n\n"
+        "- `qq <question>` — ask anything, with your shell context\n"
+        "- `qq fix` — get the fix for your last error\n"
+        "- `tgr <cmd>` — run a command so I can see its output\n"
+        "- `terminalghost dashboard` — see what I've captured\n"
+    )
+
     def _split_intent(self, text: str) -> tuple[str, str]:
         """Pull a leading `fix`/`explain` keyword off the inline context."""
         if not text:
@@ -169,6 +185,15 @@ class TriggerHandler:
         if first.lower() in self._INTENTS:
             return first.lower(), rest.strip()
         return "default", text
+
+    def _is_empty_context(self, cwd: str) -> bool:
+        """True when there's no error here and no real (non-??) command to discuss."""
+        if self._db is None:
+            return False
+        if self._db.get_last_error(cwd=cwd) is not None:
+            return False
+        recent = self._db.get_recent_commands(limit=10)
+        return not any(not e.cmd.strip().startswith("??") for e in recent)
 
     def _recent_exchange(self) -> tuple[str, str] | None:
         if self._last_exchange is None:

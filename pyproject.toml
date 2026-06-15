@@ -31,6 +31,8 @@ dependencies = [
     "psutil>=6.0",
     # Terminal UI — banner, themed output, live-markdown streaming answers
     "rich>=13.7",
+    # Full-screen dashboard (terminalghost dashboard)
+    "textual>=0.60",
 ]
 
 [project.optional-dependencies]

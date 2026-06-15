@@ -76,6 +76,10 @@ function global:qq { terminalghost ask @args }
 # tga — run the command TerminalGhost last suggested (asks first).
 function global:tgr { terminalghost exec @args }
 function global:tga { terminalghost apply @args }
+# tg: ask normally, but explain piped input (e.g. `make 2>&1 | tg`).
+function global:tg {
+  if ([Console]::IsInputRedirected) { $input | terminalghost explain } else { terminalghost ask @args }
+}
 
 # `??` works as a function name in Windows PowerShell 5.1; in PowerShell 7+
 # it collides with the null-coalescing operator, so it is defined only where

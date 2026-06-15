@@ -19,6 +19,8 @@ pid_file = "~/.local/share/terminalghost/terminalghost.pid"
 [ui]
 # Color policy: "auto" (color only on a TTY), "always", or "never".
 color = "auto"
+# Palette: "dark" | "light" | "high-contrast". Switch with `terminalghost theme`.
+theme = "dark"
 # Show the brand banner on `init` / `start`.
 banner = true
 # Render streamed ?? answers as live markdown (vs. plain streamed text).

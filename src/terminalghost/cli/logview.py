@@ -13,9 +13,9 @@ def cmd_log(config, limit: int) -> int:
     from rich.table import Table
 
     from terminalghost.storage.db import Database
-    from terminalghost.ui import get_console
+    from terminalghost.ui import console_for
 
-    console = get_console(color=config.ui.color)
+    console = console_for(config)
     limit = max(1, min(limit, config.general.history_size))
 
     db = Database(

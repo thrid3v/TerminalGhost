@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import TextIO
+from typing import TYPE_CHECKING, TextIO
 
 from rich.console import Console
 
-from terminalghost.ui.theme import TG_THEME
+from terminalghost.ui.theme import get_theme
+
+if TYPE_CHECKING:
+    from terminalghost.config.loader import Config
 
 
 def resolve_color(mode: str = "auto", stream: TextIO | None = None) -> bool:
@@ -38,20 +41,29 @@ def resolve_color(mode: str = "auto", stream: TextIO | None = None) -> bool:
 
 
 def get_console(
-    *, color: str = "auto", stderr: bool = False, record: bool = False
+    *, color: str = "auto", theme: str = "dark", stderr: bool = False,
+    record: bool = False,
 ) -> Console:
-    """A themed Rich Console with our color policy applied.
+    """A themed Rich Console with our color + theme policy applied.
 
-    `color` is the config.ui.color mode ("auto" | "always" | "never").
+    `color` is the config.ui.color mode ("auto" | "always" | "never");
+    `theme` is the config.ui.theme name ("dark" | "light" | "high-contrast").
     """
     stream = sys.stderr if stderr else sys.stdout
     enabled = resolve_color(color, stream)
     return Console(
-        theme=TG_THEME,
+        theme=get_theme(theme),
         stderr=stderr,
         highlight=False,
         no_color=not enabled,
         force_terminal=True if (color == "always") else None,
         emoji=False,
         record=record,
+    )
+
+
+def console_for(config: "Config", *, stderr: bool = False, record: bool = False) -> Console:
+    """A console themed from `config` (color + theme) — the usual entry point."""
+    return get_console(
+        color=config.ui.color, theme=config.ui.theme, stderr=stderr, record=record
     )

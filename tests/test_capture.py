@@ -37,7 +37,7 @@ class Collector:
         self.events.append((event, shell_pid, shell))
         self.got_event.set()
 
-    async def on_query(self, cmd, cwd, send):
+    async def on_query(self, cmd, cwd, send, context=None):
         self.queries.append((cmd, cwd))
         await send("ANSWER for ")
         await send(cmd)

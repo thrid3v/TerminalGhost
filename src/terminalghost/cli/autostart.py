@@ -79,9 +79,9 @@ def _windows_startup_script() -> Path:
 
 
 def cmd_enable(config) -> int:
-    from terminalghost.ui import get_console
+    from terminalghost.ui import console_for
 
-    console = get_console(color=config.ui.color)
+    console = console_for(config)
     try:
         if sys.platform == "linux":
             _enable_systemd(console)
@@ -99,9 +99,9 @@ def cmd_enable(config) -> int:
 
 
 def cmd_disable(config) -> int:
-    from terminalghost.ui import get_console
+    from terminalghost.ui import console_for
 
-    console = get_console(color=config.ui.color)
+    console = console_for(config)
     if sys.platform == "linux":
         subprocess.run(["systemctl", "--user", "disable", "--now", SERVICE_NAME],
                        check=False)

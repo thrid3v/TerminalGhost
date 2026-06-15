@@ -91,11 +91,20 @@ terminalghost disable     # undo enable
 terminalghost uninstall   # remove the shell hook block from your profile
 terminalghost exec <cmd>  # run a command, capturing its output for ?? (alias: tgr)
 terminalghost apply       # run the command ?? last suggested (alias: tga)
+terminalghost dashboard   # full-screen view: status, recent commands, output
+terminalghost explain     # explain piped output / a file: make 2>&1 | tg explain
+terminalghost cheatsheet  # everything you can do, at a glance
+terminalghost use <b>     # switch LLM: use ollama:mistral | use claude | use openai
+terminalghost theme <t>   # dark | light | high-contrast
 terminalghost --version
 ```
 
 (`ask`, `hint`, `hook-path`, `run` also exist; they're what the shell integration and
 service files call.)
+
+When you `qq`, the answer renders in a card and — if there's a fix — shows an inline
+**[R]un / [C]opy / [E]dit** bar so you can apply it in one keystroke. `terminalghost
+dashboard` opens a full-screen view of what's been captured.
 
 ## LLM backends
 
@@ -115,7 +124,8 @@ Any key can be overridden by an env var of the form `TG_SECTION__KEY` (double un
 e.g. `TG_LLM__BACKEND=claude`, `TG_LLM__OLLAMA__MODEL=mistral`, `TG_UI__COLOR=never`.
 
 Highlights:
-- `[ui] color` = `auto | always | never`, `markdown` = render answers as live markdown.
+- `[ui] color` = `auto | always | never`, `theme` = `dark | light | high-contrast`
+  (or `terminalghost theme <name>`), `markdown` = render answers as live markdown.
 - `[general] port = 0` picks a free port automatically.
 - `[llm] followup_seconds` controls the conversational follow-up window.
 

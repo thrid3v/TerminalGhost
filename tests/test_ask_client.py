@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 
+from terminalghost.cli import client
 from terminalghost.config.loader import Config
 from terminalghost.cli.client import (
     _answering_model,
@@ -69,6 +70,47 @@ def test_render_answer_rich_renders_markdown_and_footer():
     assert "Title" in out
     assert "answer" in out
     assert cfg.llm.ollama.model in out  # footer shows the model
+
+
+def test_post_answer_actions_run(monkeypatch):
+    calls = {}
+    monkeypatch.setattr(client, "_fetch_suggestion", lambda c: "git status")
+    monkeypatch.setattr(client, "_read_key", lambda: "r")
+    monkeypatch.setattr(client, "_cmd_exec", lambda c, cmd: calls.setdefault("exec", cmd))
+    client._post_answer_actions(Config())
+    assert calls["exec"] == "git status"
+
+
+def test_post_answer_actions_copy(monkeypatch):
+    calls = {}
+    monkeypatch.setattr(client, "_fetch_suggestion", lambda c: "git status")
+    monkeypatch.setattr(client, "_read_key", lambda: "C")  # case-insensitive
+    monkeypatch.setattr(client, "_copy_to_clipboard", lambda cmd, c: calls.setdefault("copy", cmd))
+    monkeypatch.setattr(client, "_cmd_exec", lambda c, cmd: calls.setdefault("exec", cmd))
+    client._post_answer_actions(Config())
+    assert calls.get("copy") == "git status"
+    assert "exec" not in calls
+
+
+def test_post_answer_actions_dismiss(monkeypatch):
+    calls = {}
+    monkeypatch.setattr(client, "_fetch_suggestion", lambda c: "rm -rf /tmp/x")
+    monkeypatch.setattr(client, "_read_key", lambda: "\n")
+    monkeypatch.setattr(client, "_cmd_exec", lambda c, cmd: calls.setdefault("exec", cmd))
+    client._post_answer_actions(Config())
+    assert "exec" not in calls  # any non-action key dismisses
+
+
+def test_post_answer_actions_no_suggestion(monkeypatch):
+    monkeypatch.setattr(client, "_fetch_suggestion", lambda c: "")
+    monkeypatch.setattr(client, "_read_key", lambda: (_ for _ in ()).throw(AssertionError))
+    client._post_answer_actions(Config())  # returns before reading a key
+
+
+def test_read_input_from_file(tmp_path):
+    f = tmp_path / "log.txt"
+    f.write_text("build failed: missing semicolon")
+    assert "missing semicolon" in client._read_input(str(f))
 
 
 def test_render_answer_rich_handles_empty_response():

@@ -61,9 +61,9 @@ def cmd_init(config, config_path: str | None) -> int:
     from rich.prompt import Confirm, Prompt
 
     from terminalghost import __version__
-    from terminalghost.ui import get_console, render_banner
+    from terminalghost.ui import console_for, render_banner
 
-    console = get_console(color=config.ui.color)
+    console = console_for(config)
     console.print(render_banner(__version__))
     console.print(
         "\nLet's get you set up. This takes about a minute.\n", style="tg.muted"
@@ -148,14 +148,17 @@ def cmd_init(config, config_path: str | None) -> int:
     console.print()
     console.print("[tg.success]All set![/] Restart your shell (or open a new tab), then:")
     console.print("  run a command, then type [tg.key]??[/] to ask about it.")
-    console.print("[tg.muted]Run `terminalghost doctor` any time to check things over.[/]")
+    console.print(
+        "[tg.muted]See [tg.key]terminalghost cheatsheet[/] for everything you can do, "
+        "or [tg.key]terminalghost doctor[/] to check things over.[/]"
+    )
     return 0
 
 
 def cmd_uninstall(config, shell: str | None) -> int:
-    from terminalghost.ui import get_console
+    from terminalghost.ui import console_for
 
-    console = get_console(color=config.ui.color)
+    console = console_for(config)
     shell = shell or profiles.detect_shell()
     if not shell:
         console.print(

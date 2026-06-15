@@ -85,6 +85,7 @@ class Daemon:
                 on_query=self._on_query,
                 on_hint=self._on_hint,
                 on_suggestion=self._on_suggestion,
+                on_reload=self._on_reload,
                 auth_token=auth_token,
             )
             await receiver.start()
@@ -137,7 +138,7 @@ class Daemon:
             event.cmd = _redact_command(event.cmd)
         self._db.insert_command(event)
 
-    async def _on_query(self, cmd: str, cwd: str, send) -> None:
+    async def _on_query(self, cmd: str, cwd: str, send, context: str | None = None) -> None:
         """Handle a ?? query: record it, then stream the answer back."""
         assert self._db is not None and self._trigger is not None
         self._db.insert_command(
@@ -150,7 +151,7 @@ class Daemon:
                 duration_ms=0,
             )
         )
-        await self._trigger.handle(cmd, cwd, send=send)
+        await self._trigger.handle(cmd, cwd, send=send, pasted=context)
 
     async def _on_hint(self, cwd: str, send) -> None:
         """Stream a one-line proactive hint (best-effort; records nothing)."""
@@ -163,6 +164,11 @@ class Daemon:
         command = self._trigger.last_suggestion()
         if command:
             await send(command)
+
+    async def _on_reload(self, send) -> None:
+        """Hot-reload config (used by `terminalghost use` to switch backends)."""
+        self._reload_config()
+        await send("ok")
 
     def _session_for(self, shell_pid: int | None, shell: str | None) -> int:
         assert self._db is not None
@@ -387,6 +393,17 @@ def main() -> None:
     enable = sub.add_parser("enable", help="start the daemon automatically at login")
     enable.add_argument("--shell", help=argparse.SUPPRESS)
     sub.add_parser("disable", help="stop starting the daemon at login")
+    sub.add_parser("cheatsheet", help="show the TerminalGhost command cheatsheet")
+    theme_p = sub.add_parser("theme", help="set the color theme")
+    theme_p.add_argument("name", help="dark | light | high-contrast")
+    use_p = sub.add_parser("use", help="switch LLM backend/model, e.g. use ollama:mistral")
+    use_p.add_argument("target", help="backend[:model] (ollama | claude | openai)")
+    dash = sub.add_parser("dashboard", help="open the full-screen TerminalGhost dashboard")
+    dash.add_argument("--once", action="store_true", help=argparse.SUPPRESS)
+    explain_p = sub.add_parser(
+        "explain", help="explain piped output or a file (e.g. make 2>&1 | tg explain)"
+    )
+    explain_p.add_argument("file", nargs="?", help="file to explain (default: stdin)")
     args = parser.parse_args()
 
     # hook-path must stay silent + dependency-free: it runs on every shell start.
@@ -451,6 +468,32 @@ def main() -> None:
         from terminalghost.cli.autostart import cmd_disable
 
         sys.exit(cmd_disable(config))
+    elif command == "cheatsheet":
+        from terminalghost.cli.cheatsheet import cmd_cheatsheet
+
+        sys.exit(cmd_cheatsheet(config))
+    elif command == "theme":
+        from terminalghost.cli.settings import cmd_theme
+
+        sys.exit(cmd_theme(config, args.config, args.name))
+    elif command == "use":
+        from terminalghost.cli.settings import cmd_use
+
+        sys.exit(cmd_use(config, args.config, args.target))
+    elif command == "dashboard":
+        try:
+            from terminalghost.cli.dashboard import cmd_dashboard
+        except ImportError:
+            print(
+                "The dashboard needs textual: pip install textual",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        sys.exit(cmd_dashboard(config))
+    elif command == "explain":
+        from terminalghost.cli import client
+
+        sys.exit(client._cmd_explain(config, args.file))
 
 
 def _cmd_hook_path(shell: str) -> int:
@@ -538,9 +581,9 @@ def _cmd_start(config: Config, config_path: str | None) -> int:
         print(f"daemon failed to start; see {log_path}", file=sys.stderr)
         return 1
     _show_banner(config)
-    from terminalghost.ui import get_console
+    from terminalghost.ui import console_for
 
-    console = get_console(color=config.ui.color)
+    console = console_for(config)
     port = _effective_port(config)  # resolves the bound port when general.port == 0
     console.print(
         f"[tg.success]✓[/] daemon started (pid {real_pid}), listening on "
@@ -570,9 +613,9 @@ def _show_banner(config: Config) -> None:
     if not config.ui.banner:
         return
     from terminalghost import __version__
-    from terminalghost.ui import get_console, render_banner
+    from terminalghost.ui import console_for, render_banner
 
-    console = get_console(color=config.ui.color)
+    console = console_for(config)
     console.print(render_banner(__version__, backend=config.llm.backend))
 
 

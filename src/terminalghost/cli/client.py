@@ -27,6 +27,8 @@ ASK_IDLE_TIMEOUT = 300.0
 HINT_TIMEOUT = 12.0
 # Cap on captured output the `exec` wrapper keeps (tail); the daemon trims more.
 EXEC_CAPTURE_BYTES = 64 * 1024
+# Cap on text sent with `explain` (the daemon's token budget trims further).
+EXPLAIN_MAX_CHARS = 8000
 
 
 def _answering_model(config: "Config") -> str:
@@ -51,26 +53,63 @@ def _iter_socket_text(sock: socket.socket):
 
 
 def _cmd_ask(config: "Config", text: str, copy: bool = False) -> int:
-    """Send a ?? query to the daemon and render the streamed answer.
+    """Send a ?? query to the daemon and render the streamed answer."""
+    cmd = "??" if not text else f"?? {text}"
+    payload = {"type": "query", "cmd": cmd, "cwd": os.getcwd()}
+    return _run_query(config, payload, copy=copy)
 
-    This is the client end of the response channel: it runs in the user's
-    terminal, so writing to its stdout is what makes the answer visible. With
-    a TTY it renders the answer as live markdown with a spinner + footer;
-    otherwise it streams plain text (pipes, NO_COLOR, ui.markdown = false).
+
+def _cmd_explain(config: "Config", file: str | None) -> int:
+    """Explain piped output or a file: `make 2>&1 | tg explain` / `tg explain log`."""
+    text = _read_input(file)
+    if not text.strip():
+        print(
+            "terminalghost explain: nothing to explain — pipe output or pass a file",
+            file=sys.stderr,
+        )
+        return 2
+    payload = {
+        "type": "query",
+        "cmd": "?? explain this output",
+        "cwd": os.getcwd(),
+        "context": text[:EXPLAIN_MAX_CHARS],
+    }
+    return _run_query(config, payload)
+
+
+def _read_input(file: str | None) -> str:
+    if file:
+        try:
+            with open(file, encoding="utf-8", errors="replace") as fh:
+                return fh.read()
+        except OSError as exc:
+            print(f"terminalghost explain: cannot read {file}: {exc}", file=sys.stderr)
+            return ""
+    try:
+        data = sys.stdin.buffer.read() if hasattr(sys.stdin, "buffer") else sys.stdin.read()
+    except (OSError, ValueError):
+        return ""
+    return data.decode("utf-8", errors="replace") if isinstance(data, bytes) else data
+
+
+def _run_query(config: "Config", payload: dict, copy: bool = False) -> int:
+    """Send a query payload to the daemon and render the streamed answer.
+
+    The client runs in the user's terminal, so writing to stdout is what makes
+    the answer visible. With a TTY it renders a live-markdown card + an inline
+    apply action bar; otherwise it streams plain text.
     """
-    # Windows consoles may default to a legacy codepage (cp1252) that cannot
-    # encode characters the LLM (or our header) emits; force UTF-8 output.
+    # Windows consoles may default to cp1252 which can't encode what the LLM
+    # emits; force UTF-8 output.
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except (AttributeError, OSError):
-        pass  # non-reconfigurable stream (e.g. pipe wrapper) — best effort
+        pass
 
     from terminalghost.ui import resolve_color
 
-    cmd = "??" if not text else f"?? {text}"
-    payload = json.dumps(
-        {"type": "query", "cmd": cmd, "cwd": os.getcwd(), "token": read_token()}
-    ) + "\n"
+    payload = {**payload, "token": read_token()}
+    line = (json.dumps(payload) + "\n").encode("utf-8")
     use_rich = config.ui.markdown and resolve_color(config.ui.color, sys.stdout)
 
     try:
@@ -83,9 +122,9 @@ def _cmd_ask(config: "Config", text: str, copy: bool = False) -> int:
 
     try:
         with sock:
-            sock.sendall(payload.encode("utf-8"))
-            # Generous idle timeout: a cold model can take a while to first
-            # token, but a wedged daemon shouldn't freeze the prompt forever.
+            sock.sendall(line)
+            # Generous idle timeout: a cold model can take a while to first token,
+            # but a wedged daemon shouldn't freeze the prompt forever.
             sock.settimeout(ASK_IDLE_TIMEOUT)
             if use_rich:
                 answer = _render_answer_rich(config, sock)
@@ -93,13 +132,16 @@ def _cmd_ask(config: "Config", text: str, copy: bool = False) -> int:
                 answer = _render_answer_plain(sock)
         if copy and answer.strip():
             _copy_to_clipboard(answer.strip(), config)
+        # Close the loop: offer to run/copy/edit the suggested command inline.
+        if use_rich and _stdin_is_tty():
+            _post_answer_actions(config)
     except KeyboardInterrupt:
         print()
         return 130
     except socket.timeout:
-        from terminalghost.ui import get_console
+        from terminalghost.ui import console_for
 
-        get_console(color=config.ui.color, stderr=True).print(
+        console_for(config, stderr=True).print(
             "[tg.error]TerminalGhost timed out waiting for the daemon.[/]"
         )
         return 1
@@ -107,6 +149,93 @@ def _cmd_ask(config: "Config", text: str, copy: bool = False) -> int:
         _print_unreachable(config)
         return 1
     return 0
+
+
+def _stdin_is_tty() -> bool:
+    try:
+        return sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def _post_answer_actions(config: "Config") -> None:
+    """Show the suggested command and an inline action bar; act on one keypress."""
+    from rich.panel import Panel
+    from rich.text import Text
+
+    from terminalghost.ui import console_for
+
+    command = _fetch_suggestion(config)
+    if not command:
+        return
+    console = console_for(config)
+    console.print(
+        Panel(
+            Text(command, style="tg.cmd"),
+            title="▶ run this",
+            title_align="left",
+            border_style="tg.glow",
+            padding=(0, 1),
+            expand=False,
+        )
+    )
+    console.print(
+        "  [tg.key]R[/] run   [tg.key]C[/] copy   [tg.key]E[/] edit"
+        "   [tg.muted]· any other key dismiss[/]"
+    )
+    try:
+        key = _read_key().lower()
+    except (OSError, EOFError, KeyboardInterrupt):
+        print()
+        return
+    if key == "r":
+        print()
+        _cmd_exec(config, command)
+    elif key == "c":
+        _copy_to_clipboard(command, config)
+    elif key == "e":
+        edited = _edit_command(command).strip()
+        if edited:
+            _cmd_exec(config, edited)
+    else:
+        print()  # dismiss — leave a clean line
+
+
+def _read_key() -> str:
+    """Read one keypress from a TTY (no Enter needed). Cross-platform."""
+    if os.name == "nt":
+        import msvcrt
+
+        return msvcrt.getwch()
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        return sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def _edit_command(command: str) -> str:
+    """Let the user edit `command` before running. Prefilled on POSIX."""
+    print()
+    if os.name != "nt":
+        try:
+            import readline
+
+            readline.set_startup_hook(lambda: readline.insert_text(command))
+            try:
+                return input("edit ▸ ")
+            finally:
+                readline.set_startup_hook(None)
+        except Exception:  # noqa: BLE001 — readline unavailable; fall through
+            pass
+    print(f"current: {command}")
+    edited = input("edit ▸ ")
+    return edited or command
 
 
 def _write_raw(data: bytes) -> None:
@@ -205,9 +334,9 @@ def _cmd_apply(config: "Config", assume_yes: bool = False) -> int:
     """Run the command TerminalGhost last suggested, after confirmation."""
     from rich.markup import escape
 
-    from terminalghost.ui import get_console
+    from terminalghost.ui import console_for
 
-    console = get_console(color=config.ui.color)
+    console = console_for(config)
     command = _fetch_suggestion(config)
     if not command:
         console.print(
@@ -277,19 +406,19 @@ def _cmd_hint(config: "Config") -> int:
         return 0  # daemon down / no hint — never disrupt the prompt
     from rich.markup import escape
 
-    from terminalghost.ui import get_console
+    from terminalghost.ui import console_for
     from terminalghost.ui.theme import GHOST_GLYPH
 
     line = text.splitlines()[0][:200]
-    console = get_console(color=config.ui.color)
+    console = console_for(config)
     console.print(f"[tg.muted]{GHOST_GLYPH} hint:[/] [tg.muted]{escape(line)}[/]")
     return 0
 
 
 def _print_unreachable(config: "Config") -> None:
-    from terminalghost.ui import get_console
+    from terminalghost.ui import console_for
 
-    console = get_console(color=config.ui.color, stderr=True)
+    console = console_for(config, stderr=True)
     console.print(
         "[tg.error]TerminalGhost daemon is not reachable.[/] "
         "Start it with: [tg.key]terminalghost start[/]"
@@ -316,38 +445,44 @@ def _render_answer_rich(config: "Config", sock: socket.socket, console=None) -> 
     Returns the plain answer text (for --copy)."""
     from rich.live import Live
     from rich.markdown import Markdown
+    from rich.panel import Panel
     from rich.spinner import Spinner
     from rich.text import Text
 
-    from terminalghost.ui import get_console
+    from terminalghost.ui import console_for
     from terminalghost.ui.theme import GHOST_GLYPH
 
     if console is None:
-        console = get_console(color=config.ui.color)
+        console = console_for(config)
 
-    header = Text()
-    header.append(f"{GHOST_GLYPH} ", style="tg.accent")
-    header.append("TerminalGhost", style="tg.brand")
-    console.print(header)
+    title = f"{GHOST_GLYPH} TerminalGhost"
+
+    def card(content):
+        # The answer lives in a bordered card so it reads as one intentional
+        # reply rather than blending into shell scrollback.
+        return Panel(
+            content, title=title, title_align="left",
+            border_style="tg.glow", padding=(0, 1),
+        )
 
     start = time.monotonic()
     buf: list[str] = []
     spinner = Spinner("dots", text=Text(" thinking…", style="tg.muted"))
     with Live(
-        spinner,
+        card(spinner),
         console=console,
         refresh_per_second=12,
         vertical_overflow="visible",
     ) as live:
         for chunk in _iter_socket_text(sock):
             buf.append(chunk)
-            live.update(Markdown("".join(buf).strip()))
+            live.update(card(Markdown("".join(buf).strip())))
         if not buf:
-            live.update(Text("(no response)", style="tg.muted"))
+            live.update(card(Text("(no response)", style="tg.muted")))
 
     elapsed = time.monotonic() - start
     footer = Text(
-        f"{config.llm.backend} · {_answering_model(config)} · {elapsed:.1f}s",
+        f"  {config.llm.backend} · {_answering_model(config)} · {elapsed:.1f}s",
         style="tg.footer",
     )
     console.print(footer)
@@ -359,7 +494,7 @@ def _copy_to_clipboard(text: str, config: "Config") -> None:
     import shutil
     import subprocess
 
-    from terminalghost.ui import get_console
+    from terminalghost.ui import console_for
 
     data = text.encode("utf-8", errors="replace")
     ok = False
@@ -383,7 +518,7 @@ def _copy_to_clipboard(text: str, config: "Config") -> None:
     except (OSError, subprocess.CalledProcessError):
         ok = False
 
-    console = get_console(color=config.ui.color)
+    console = console_for(config)
     if ok:
         console.print("[tg.muted]copied to clipboard[/]")
     else:
