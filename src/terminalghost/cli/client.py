@@ -14,7 +14,7 @@ import sys
 import time
 from typing import TYPE_CHECKING
 
-from terminalghost.runtime import effective_port
+from terminalghost.runtime import effective_port, read_token
 
 if TYPE_CHECKING:
     from terminalghost.config.loader import Config
@@ -68,7 +68,9 @@ def _cmd_ask(config: "Config", text: str, copy: bool = False) -> int:
     from terminalghost.ui import resolve_color
 
     cmd = "??" if not text else f"?? {text}"
-    payload = json.dumps({"type": "query", "cmd": cmd, "cwd": os.getcwd()}) + "\n"
+    payload = json.dumps(
+        {"type": "query", "cmd": cmd, "cwd": os.getcwd(), "token": read_token()}
+    ) + "\n"
     use_rich = config.ui.markdown and resolve_color(config.ui.color, sys.stdout)
 
     try:
@@ -176,7 +178,7 @@ def _request(config: "Config", obj: dict, connect_timeout: float = 3.0,
 
     Returns "" on any connection problem — callers treat that as "no answer".
     """
-    payload = (json.dumps(obj) + "\n").encode("utf-8")
+    payload = (json.dumps({**obj, "token": read_token()}) + "\n").encode("utf-8")
     data = b""
     try:
         with socket.create_connection(
@@ -246,6 +248,7 @@ def _send_run_event(config: "Config", cmd: str, exit_code: int, duration_ms: int
         "shell": "exec",
         "source": "run",
         "output": output,
+        "token": read_token(),
     }) + "\n"
     try:
         with socket.create_connection(

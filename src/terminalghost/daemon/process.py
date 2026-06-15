@@ -33,6 +33,7 @@ from terminalghost.context.assembler import ContextAssembler
 from terminalghost.llm.base import get_backend
 from terminalghost.runtime import (
     effective_port as _effective_port,
+    ensure_token,
     read_pid as _read_pid,
     remove_port_file as _remove_port_file,
     write_port_file as _write_port_file,
@@ -72,6 +73,7 @@ class Daemon:
             )
             self._db.open()
             _assert_safe_host(general.host)
+            auth_token = ensure_token()
             backend = get_backend(self._config)
             assembler = ContextAssembler(self._db, self._config)
             self._trigger = TriggerHandler(self._db, assembler, backend, self._config)
@@ -83,6 +85,7 @@ class Daemon:
                 on_query=self._on_query,
                 on_hint=self._on_hint,
                 on_suggestion=self._on_suggestion,
+                auth_token=auth_token,
             )
             await receiver.start()
             # Record the actually-bound port so clients can find us even when

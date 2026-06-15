@@ -61,6 +61,11 @@ payload = {
 }
 if output:
     payload["output"] = output
+try:
+    with open(os.path.expanduser("~/.local/share/terminalghost/token")) as _tf:
+        payload["token"] = _tf.read().strip()
+except OSError:
+    pass
 line = json.dumps(payload) + "\n"
 try:
     with socket.create_connection(

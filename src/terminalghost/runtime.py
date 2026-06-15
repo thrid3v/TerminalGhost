@@ -7,10 +7,48 @@
 from __future__ import annotations
 
 import os
+import secrets
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from terminalghost.config.loader import Config
+
+# Fixed location (independent of config) so the daemon, the CLI clients, and the
+# shell hooks all agree on where the auth token lives without sharing config.
+TOKEN_PATH = os.path.join("~", ".local", "share", "terminalghost", "token")
+
+
+def token_path() -> str:
+    return os.path.expanduser(TOKEN_PATH)
+
+
+def ensure_token() -> str:
+    """Return the daemon's auth token, generating + persisting one (0600) if
+    needed. Stable across restarts so already-sourced hooks keep working."""
+    path = token_path()
+    existing = read_token()
+    if existing:
+        return existing
+    token = secrets.token_hex(16)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Create with owner-only perms where the OS honors them (POSIX).
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="ascii") as fh:
+            fh.write(token)
+    except OSError:
+        with open(path, "w", encoding="ascii") as fh:
+            fh.write(token)
+    return token
+
+
+def read_token() -> str:
+    """The current auth token, or "" if none has been written yet."""
+    try:
+        with open(token_path(), encoding="ascii") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
 
 
 def read_pid(path: str) -> int | None:

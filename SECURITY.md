@@ -15,12 +15,12 @@ TerminalGhost is a **local-first** tool. Its trust boundary is your machine.
   (`127.0.0.1`, default port 48632). It will **refuse to bind a non-loopback
   address** unless you explicitly set `TG_ALLOW_REMOTE=1`, so it is not exposed
   to the network by default.
-- **Local trust.** The loopback socket is **not authenticated**. Any process
-  running as a user who can reach loopback on your machine can send command
-  events, trigger an LLM query, or read the last suggested command. On a
-  single-user machine this is equivalent to that user's existing shell access.
-  **On shared/multi-user hosts, treat the daemon as readable by other local
-  users** (a per-user auth token is planned — see "Hardening" below).
+- **Local auth.** The loopback socket is protected by a **per-user token**: the
+  daemon generates a random token on first start, stores it owner-readable
+  (`0600`) at `~/.local/share/terminalghost/token`, and rejects any connection
+  that doesn't present it. The CLI clients and shell hooks read that file, so
+  only processes that can read your token (i.e. you) can post events, trigger a
+  query, or read the last suggestion — even on a shared host.
 - **Secrets.** Command text and any captured output are scanned and redacted
   before storage (assignments like `TOKEN=…`, `--password …`, `Authorization:
   Bearer …`, credentials in URLs, and well-known key formats such as
@@ -42,10 +42,6 @@ TerminalGhost is a **local-first** tool. Its trust boundary is your machine.
 
 - Keep `general.host` on a loopback address (the default).
 - Set restrictive permissions on `~/.config/terminalghost/` and
-  `~/.local/share/terminalghost/` if other users share the host.
+  `~/.local/share/terminalghost/` if other users share the host (the auth token
+  there is already written `0600`).
 - Prefer the local Ollama backend so no shell context leaves the machine.
-
-## Planned
-
-- A per-user authentication token for the loopback socket, so other local
-  users on a shared host cannot read from or post to your daemon.
