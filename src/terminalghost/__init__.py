@@ -13,4 +13,4 @@
 #     heavyweight and force early SQLite/config initialization on every
 #     `import terminalghost`. Submodules should be imported lazily at call sites.
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

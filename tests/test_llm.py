@@ -182,9 +182,69 @@ def test_cloud_unknown_provider_raises():
         CloudBackend("gemini")
 
 
-async def test_openai_stub_raises():
-    with pytest.raises(NotImplementedError):
-        await CloudBackend("openai", api_key="sk-x").query("hi")
+async def test_openai_query_returns_content():
+    def handler(request):
+        body = json.loads(request.content)
+        assert body["model"] == "gpt-4o-mini"
+        assert body["stream"] is False
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "use --force"}}]}
+        )
+
+    backend = CloudBackend(
+        "openai", api_key="sk-x", model="gpt-4o-mini",
+        transport=httpx.MockTransport(handler),
+    )
+    assert await backend.query("hi") == "use --force"
+
+
+async def test_openai_stream_parses_sse():
+    sse = (
+        'data: {"choices":[{"delta":{"content":"hel"}}]}\n\n'
+        'data: {"choices":[{"delta":{"content":"lo"}}]}\n\n'
+        "data: [DONE]\n\n"
+    )
+
+    def handler(request):
+        return httpx.Response(200, content=sse.encode())
+
+    backend = CloudBackend(
+        "openai", api_key="sk-x", transport=httpx.MockTransport(handler)
+    )
+    chunks = [c async for c in backend.stream_query("hi")]
+    assert "".join(chunks) == "hello"
+
+
+async def test_openai_error_status_mapped():
+    def handler(request):
+        return httpx.Response(401, json={"error": {"message": "bad key"}})
+
+    backend = CloudBackend(
+        "openai", api_key="sk-x", transport=httpx.MockTransport(handler)
+    )
+    with pytest.raises(LLMResponseError):
+        await backend.query("hi")
+
+
+def test_openai_available_with_local_base_url_no_key():
+    backend = CloudBackend("openai", api_key="", base_url="http://localhost:1234/v1")
+    assert backend.is_available() is True
+
+
+def test_openai_unavailable_without_key(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    backend = CloudBackend("openai", api_key="")
+    assert backend.is_available() is False
+
+
+def test_parse_sse_line_variants():
+    assert CloudBackend._parse_sse_line("") is None
+    assert CloudBackend._parse_sse_line(": comment") is None
+    assert CloudBackend._parse_sse_line("data: [DONE]") == "\x00__SSE_DONE__"
+    assert (
+        CloudBackend._parse_sse_line('data: {"choices":[{"delta":{"content":"x"}}]}')
+        == "x"
+    )
 
 
 def test_resolve_api_key_prefers_config(monkeypatch):

@@ -28,6 +28,22 @@ _PREAMBLE = (
     "If a command failed, explain why and give the exact fix command first."
 )
 
+# Extra instruction appended to the preamble for `?? fix` / `?? explain`.
+_INTENT_SUFFIX = {
+    "fix": (
+        "\nThe user wants the fix only: respond with the corrected command(s)"
+        " first, then at most one short line explaining why."
+    ),
+    "explain": (
+        "\nThe user wants to understand: explain clearly and thoroughly, then"
+        " give the command if relevant."
+    ),
+    "hint": (
+        "\nRespond with a SINGLE short line (max ~100 chars): the single most"
+        " likely fix as a command or a terse tip. No preamble, no markdown."
+    ),
+}
+
 
 class ContextAssembler:
     """Builds an LLM prompt from shell context."""
@@ -36,16 +52,34 @@ class ContextAssembler:
         self._db = db
         self._config = config
 
-    def assemble(self, cwd: str, inline_context: str = "") -> str:
-        """Build and return the complete prompt string within token_budget."""
+    def assemble(
+        self,
+        cwd: str,
+        inline_context: str = "",
+        *,
+        intent: str = "default",
+        prior_exchange: tuple[str, str] | None = None,
+    ) -> str:
+        """Build and return the complete prompt string within token_budget.
+
+        `intent` ("fix" | "explain" | "default") tunes the preamble.
+        `prior_exchange` is the (question, answer) from a recent ?? so the user
+        can ask follow-ups.
+        """
         budget = self._config.context.token_budget
-        last_error = self._db.get_last_error()
+        # Scope the surfaced error to this directory so a ?? doesn't pick up an
+        # unrelated failure from another terminal/project.
+        last_error = self._db.get_last_error(cwd=cwd)
         # newest-first from the DB; the prompt wants oldest-first
         commands = list(reversed(self._db.get_recent_commands(limit=HISTORY_FETCH_LIMIT)))
         tree = self._format_directory_tree(cwd)
+        preamble = _PREAMBLE + _INTENT_SUFFIX.get(intent, "")
 
         def build(cmds: list, tree_text: str) -> str:
-            parts = [_PREAMBLE]
+            parts = [preamble]
+            if prior_exchange is not None:
+                q, a = prior_exchange
+                parts.append(f"## Earlier in this conversation\nQ: {q}\nA: {a}")
             if last_error is not None:
                 parts.append(self._format_last_error(last_error))
             if cmds:

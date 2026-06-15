@@ -1,170 +1,152 @@
 # TerminalGhost
 
-A local-first, terminal-resident AI assistant. It lives as a persistent background
-process, watches your shell commands, and answers `??` with a contextual suggestion.
+```
+ .-.    TerminalGhost
+(o o)   ask your terminal anything — just type ??
+|=#=|   local-first · ollama · v0.2.0
+ '-'
+```
 
-## How it works
+A local-first, terminal-resident AI assistant. A small background daemon watches your
+shell commands; when you type `??` at the prompt it assembles context (recent commands,
+the directory tree, the last error) and streams an answer back into your terminal.
 
-1. **Capture** — a shell hook (zsh `preexec`/`precmd`, bash `PROMPT_COMMAND`, or a
-   PowerShell `prompt` wrapper) sends each command + exit code + timing to the
-   daemon over a TCP loopback socket (fire-and-forget; the prompt never blocks).
+- **Local-first.** Defaults to [Ollama](https://ollama.com) — fully offline, no API key,
+  nothing leaves your machine. Claude and any OpenAI-compatible API are optional.
+- **Ambient.** Lives in the shell you already use; it doesn't take the terminal over.
+- **Cross-platform.** Linux, macOS, and Windows.
 
-2. **Store** — the daemon writes every event into a rolling SQLite buffer (last ~200
-   commands).
-
-3. **Context assembly** — when `??` fires, the context module reads the rolling
-   buffer, the current directory tree, and the most recent non-zero exit, and
-   assembles a structured prompt.
-
-4. **LLM query** — `??` runs the `terminalghost ask` client, which sends the query
-   to the daemon and stays connected; the daemon sends the prompt to the configured
-   backend (Ollama by default; Claude as the cloud alternative) and streams the
-   response back over the same connection into your terminal.
-
-## Installation
-
-### 1. Prerequisites
-
-- **Python 3.11+** — `python --version` to check
-- **Git** (to clone the repo)
-
-### 2. Install TerminalGhost
+## Install
 
 ```bash
-git clone https://github.com/thrid3v/TerminalGhost.git
-cd TerminalGhost
-
-# Linux / macOS
-python -m venv .venv && source .venv/bin/activate
-pip install -e .
-
-# Windows (PowerShell)
-python -m venv .venv; .\.venv\Scripts\Activate.ps1
-pip install -e .
+pipx install terminalghost      # or: uv tool install terminalghost
+terminalghost init              # interactive setup — does everything below for you
 ```
 
-(Add `".[dev]"` instead of `.` if you want to run the test suite.)
-
-### 3. Install an LLM backend
-
-**Option A — Ollama (default: free, fully local, no API key)**
-
-```bash
-# Windows
-winget install Ollama.Ollama
-
-# macOS
-brew install ollama
-
-# Linux
-curl -fsSL https://ollama.com/install.sh | sh
-```
-
-Then start the server and pull a model:
-
-```bash
-ollama serve          # skip if the Ollama app/service is already running
-ollama pull llama3.2  # small + fast (~2 GB); good for trying it out
-```
-
-Larger models give better answers — `ollama pull llama3` (~4.7 GB) — just match
-the `model` value in your config (step 4).
-
-**Option B — Claude (cloud, needs an Anthropic API key)**
-
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...   # PowerShell: $env:ANTHROPIC_API_KEY="sk-ant-..."
-```
-
-and set `backend = "claude"` in your config (step 4).
-
-### 4. Configure (optional)
-
-Defaults work out of the box with Ollama + `llama3`. To customize:
-
-```bash
-mkdir -p ~/.config/terminalghost
-cp config.example.toml ~/.config/terminalghost/config.toml
-```
-
-Edit `[llm]` `backend`, and `[llm.ollama]` `model` to match what you pulled
-(e.g. `llama3.2`).
-
-### 5. Hook up your shell
-
-```bash
-# zsh — add to ~/.zshrc:
-source /path/to/TerminalGhost/scripts/zsh_hooks.sh
-
-# bash — add to ~/.bashrc:
-source /path/to/TerminalGhost/scripts/bash_hooks.sh
-```
-
-```powershell
-# PowerShell — add to $PROFILE (notepad $PROFILE):
-$env:Path = "C:\path\to\TerminalGhost\.venv\Scripts;$env:Path"
-. C:\path\to\TerminalGhost\scripts\powershell_hooks.ps1
-```
-
-See `scripts/shell_integration.md` for details and troubleshooting.
-
-### 6. Start and use
-
-```bash
-terminalghost start
-
-cd /some/project && make build   # → exit 1
-??                               # → streamed suggestion from your local LLM
-?? give me the exact fix         # inline context works too
-```
-
-On PowerShell 7+ use `qq` instead of `??` (which is the null-coalescing operator
-there); Windows PowerShell 5.1 supports both. The first `??` after a cold start
-takes a few extra seconds while Ollama loads the model into memory.
-
-## CLI
+`terminalghost init` detects your shell, helps you pick/verify an LLM, writes a config,
+installs the shell hook, and offers to start the daemon. Then restart your shell and:
 
 ```
-terminalghost start     # start the daemon in the background
-terminalghost stop      # stop it
-terminalghost status    # running / stopped
-terminalghost restart
-terminalghost run       # run in the foreground (debugging)
-terminalghost ask [..]  # send a ?? query directly (what the ?? function calls)
+$ make build        # → exits non-zero
+$ ??                # → streamed, contextual fix
+$ ?? fix            # → just the corrected command
+$ ?? explain the error in detail
 ```
 
-## Module overview
+> Prefer Claude? `pipx install "terminalghost[cloud]"` and choose Claude in `init`
+> (or set `ANTHROPIC_API_KEY`).
 
-| Module | Responsibility |
+If anything misbehaves, run **`terminalghost doctor`** — it checks the daemon, the port,
+the LLM, your shell hooks, and the data dir, and prints the exact fix for each.
+
+## Using `??`
+
+| You type | What happens |
 |---|---|
-| `capture` | TCP hook receiver (+ planned PTY interposition, Unix-only) |
-| `storage` | SQLite rolling buffer; schema; CRUD |
-| `context` | Assembles the LLM prompt from buffer + tree + last error |
-| `llm` | Model-agnostic backend interface + Ollama + Claude |
-| `trigger` | Detects `??`, orchestrates context→LLM→streamed output |
-| `daemon` | Background process, socket server, PID management, CLI |
-| `config` | TOML loader, frozen Config dataclasses, TG_* env overrides |
+| `??` | Answer about your most recent failure / recent commands in this directory |
+| `?? <text>` | Same, plus your note (e.g. `?? why does this fail on Apple Silicon`) |
+| `?? fix <text>` | Reply with the corrected command first, minimal prose |
+| `?? explain <text>` | A thorough explanation |
+| follow-up `??` | A `??` within ~5 min remembers the previous answer for follow-ups |
 
-## Configuration reference
+On **PowerShell 7+**, `??` is the null-coalescing operator — use `qq` there (Windows
+PowerShell 5.1 gets both). In **bash**, `??` can glob; `tg` is an unambiguous alias.
 
-Config lives at `~/.config/terminalghost/config.toml` (see `config.example.toml`).
-Every key can be overridden with a `TG_SECTION__KEY` environment variable, e.g.
-`TG_LLM__BACKEND=claude`, `TG_GENERAL__PORT=49000`, `TG_LLM__OLLAMA__MODEL=mistral`.
+Add `-c`/`--copy` (e.g. `tg --copy fix`) to copy the answer to your clipboard.
 
-For the Claude backend, set `ANTHROPIC_API_KEY` in your environment (preferred
-over putting the key in the config file).
+## Commands
+
+```
+terminalghost init        # interactive first-time setup
+terminalghost doctor      # diagnose the install; print fixes
+terminalghost start       # start the daemon in the background
+terminalghost stop        # stop it
+terminalghost status      # running / stopped
+terminalghost restart
+terminalghost log [-n N]  # show recently captured commands
+terminalghost enable      # start the daemon automatically at login
+terminalghost disable     # undo enable
+terminalghost uninstall   # remove the shell hook block from your profile
+terminalghost --version
+```
+
+(`ask`, `hint`, `hook-path`, `run` also exist; they're what the shell integration and
+service files call.)
+
+## LLM backends
+
+- **Ollama (default).** Install from [ollama.com](https://ollama.com), then
+  `ollama pull llama3` (or any model — set `[llm.ollama] model` to match). Free, private,
+  offline.
+- **Claude.** `pipx install "terminalghost[cloud]"`, set `ANTHROPIC_API_KEY`, and
+  `backend = "claude"`.
+- **OpenAI-compatible.** Set `backend = "openai"`. Point `[llm.openai] base_url` at OpenAI,
+  Groq, LM Studio, llama.cpp, or Ollama's `/v1` endpoint. Local servers need no key.
+
+## Configuration
+
+Config lives at `~/.config/terminalghost/config.toml` (see
+[`config.example.toml`](src/terminalghost/_assets/config.example.toml) for every option).
+Any key can be overridden by an env var of the form `TG_SECTION__KEY` (double underscore),
+e.g. `TG_LLM__BACKEND=claude`, `TG_LLM__OLLAMA__MODEL=mistral`, `TG_UI__COLOR=never`.
+
+Highlights:
+- `[ui] color` = `auto | always | never`, `markdown` = render answers as live markdown.
+- `[general] port = 0` picks a free port automatically.
+- `[llm] followup_seconds` controls the conversational follow-up window.
+
+## Output capture (experimental, opt-in, POSIX)
+
+By default TerminalGhost sees your commands and exit codes but **not** their output.
+To let it read the actual error text, set `capture.capture_output = true` and export
+`TG_CAPTURE_OUTPUT=1` before the hooks load. The bash/zsh hooks then run your shell inside
+`script` to transcribe output. It's off by default and POSIX-only (Windows needs ConPTY).
+
+## Proactive hints (experimental, opt-in)
+
+Export `TG_HINTS=1` and the hooks will print a one-line suggestion after a failed command,
+without you asking. It blocks briefly for the model; it stays silent if nothing's useful.
+
+## Privacy
+
+Everything is local by default. Command text is scanned for obvious secrets
+(`TOKEN=…`, `--password …`, credentials in URLs) and redacted before storage;
+`capture.blocked_commands` never has its output stored. Switching to a cloud backend
+sends assembled context to that provider — your choice, off by default.
 
 ## Development
 
 ```bash
-pip install -e ".[dev]"
+git clone https://github.com/thrid3v/TerminalGhost.git
+cd TerminalGhost
+python -m venv .venv && source .venv/bin/activate    # Windows: .\.venv\Scripts\Activate.ps1
+pip install -e ".[dev,cloud]"
+
 pytest                  # run the test suite
 ruff check src tests    # lint
 ```
 
-## Requirements
+## How it works
 
-- Python 3.11+
-- Ollama running locally (default) or an Anthropic API key
-- Linux / macOS / Windows (the transport is TCP loopback; the optional PTY
-  deep-capture layer, when implemented, will be Unix-only)
+```
+shell hook ──TCP──> daemon ──> SQLite rolling buffer
+   (cmd, exit, cwd, duration; output if enabled)
+
+?? ─> `terminalghost ask` ──TCP──> daemon: assemble context ─> LLM ─> stream answer back
+```
+
+| Module | Responsibility |
+|---|---|
+| `capture` | TCP hook receiver (events + `??`/hint queries) |
+| `storage` | SQLite rolling buffer; schema; CRUD |
+| `context` | Assembles the LLM prompt from buffer + tree + last error |
+| `llm` | Backend interface + Ollama + Claude + OpenAI-compatible |
+| `trigger` | Detects `??`, runs context→LLM→streamed output |
+| `daemon` | Background process, socket server, PID/port files, CLI |
+| `cli` | `init` / `doctor` / `log` / autostart / profile management |
+| `ui` | Rich theme, banner, streamed-answer rendering |
+| `config` | TOML loader, frozen Config dataclasses, `TG_*` overrides |
+
+## License
+
+MIT — see [LICENSE](LICENSE).

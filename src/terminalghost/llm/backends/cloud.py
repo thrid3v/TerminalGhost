@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import AsyncIterator
@@ -20,6 +21,9 @@ from terminalghost.llm.base import (
 log = logging.getLogger(__name__)
 
 _ENV_VARS = {"claude": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
+
+# Sentinel returned by the SSE parser when the stream's [DONE] marker is seen.
+_SSE_DONE = "\x00__SSE_DONE__"
 
 _TRUNCATION_NOTE = (
     "\n\n[response truncated: max_tokens reached — increase llm.claude.max_tokens]"
@@ -45,6 +49,8 @@ class CloudBackend(LLMBackend):
         api_key: str = "",
         model: str = "claude-opus-4-8",
         max_tokens: int = 1024,
+        base_url: str = "https://api.openai.com/v1",
+        transport=None,
     ) -> None:
         if provider not in _ENV_VARS:
             raise ValueError(f"unknown cloud provider: {provider!r}")
@@ -52,6 +58,9 @@ class CloudBackend(LLMBackend):
         self._api_key = api_key
         self._model = model
         self._max_tokens = max_tokens
+        self._base_url = base_url.rstrip("/")
+        # Injectable httpx transport so tests can use httpx.MockTransport.
+        self._transport = transport
 
     # -- public API ----------------------------------------------------------
 
@@ -62,18 +71,29 @@ class CloudBackend(LLMBackend):
 
     async def stream_query(self, prompt: str) -> AsyncIterator[str]:
         if self._provider == "openai":
-            await self._query_openai(prompt)  # raises NotImplementedError
+            async for chunk in self._stream_openai(prompt):
+                yield chunk
             return
         async for chunk in self._stream_claude(prompt):
             yield chunk
 
     def is_available(self) -> bool:
-        """True if an API key is configured (config or env). No network call."""
+        """True if usable without a network call.
+
+        Cloud (Claude/OpenAI): an API key is configured. Exception: an OpenAI-
+        compatible server on localhost (LM Studio, llama.cpp, Ollama's compat
+        API) usually needs no key, so a local base_url counts as available.
+        """
+        if self._provider == "openai" and self._is_local_base_url():
+            return True
         try:
             self._resolve_api_key(_ENV_VARS[self._provider])
         except LLMResponseError:
             return False
         return True
+
+    def _is_local_base_url(self) -> bool:
+        return "://localhost" in self._base_url or "://127.0.0.1" in self._base_url
 
     # -- Claude --------------------------------------------------------------
 
@@ -135,12 +155,107 @@ class CloudBackend(LLMBackend):
         # 400 includes content-policy refusals; surface the API message.
         return LLMResponseError(f"Anthropic API error {exc.status_code}: {exc.message}")
 
-    # -- OpenAI (stub) ---------------------------------------------------------
+    # -- OpenAI (and OpenAI-compatible servers) --------------------------------
+
+    def _openai_headers(self) -> dict:
+        # Local compat servers may not require a key; send one only if we have it.
+        key = self._api_key or os.environ.get("OPENAI_API_KEY", "")
+        if not key and not self._is_local_base_url():
+            self._resolve_api_key("OPENAI_API_KEY")  # raises LLMResponseError
+        headers = {"Content-Type": "application/json"}
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        return headers
+
+    def _openai_body(self, prompt: str, stream: bool) -> dict:
+        return {
+            "model": self._model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": self._max_tokens,
+            "stream": stream,
+        }
 
     async def _query_openai(self, prompt: str) -> str:
-        raise NotImplementedError(
-            "the OpenAI backend is not implemented yet; set llm.backend to"
-            " 'claude' or 'ollama'"
+        import httpx
+
+        try:
+            async with httpx.AsyncClient(
+                base_url=self._base_url, timeout=60.0, transport=self._transport
+            ) as client:
+                resp = await client.post(
+                    "/chat/completions",
+                    json=self._openai_body(prompt, stream=False),
+                    headers=self._openai_headers(),
+                )
+        except httpx.TimeoutException as exc:
+            raise LLMTimeoutError(f"OpenAI request timed out: {exc}") from exc
+        except httpx.ConnectError as exc:
+            raise LLMConnectionError(
+                f"cannot reach the OpenAI-compatible API at {self._base_url}"
+            ) from exc
+        if resp.status_code != 200:
+            self._raise_openai_status(resp)
+        try:
+            return resp.json()["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, ValueError) as exc:
+            raise LLMResponseError(f"malformed OpenAI response: {exc}") from exc
+
+    async def _stream_openai(self, prompt: str) -> AsyncIterator[str]:
+        import httpx
+
+        try:
+            async with httpx.AsyncClient(
+                base_url=self._base_url, timeout=60.0, transport=self._transport
+            ) as client:
+                async with client.stream(
+                    "POST",
+                    "/chat/completions",
+                    json=self._openai_body(prompt, stream=True),
+                    headers=self._openai_headers(),
+                ) as resp:
+                    if resp.status_code != 200:
+                        await resp.aread()
+                        self._raise_openai_status(resp)
+                    async for line in resp.aiter_lines():
+                        piece = self._parse_sse_line(line)
+                        if piece == _SSE_DONE:
+                            return
+                        if piece:
+                            yield piece
+        except httpx.TimeoutException as exc:
+            raise LLMTimeoutError(f"OpenAI request timed out: {exc}") from exc
+        except httpx.ConnectError as exc:
+            raise LLMConnectionError(
+                f"cannot reach the OpenAI-compatible API at {self._base_url}"
+            ) from exc
+
+    @staticmethod
+    def _parse_sse_line(line: str) -> str | None:
+        """Extract the text delta from one SSE line, or _SSE_DONE / None."""
+        line = line.strip()
+        if not line or not line.startswith("data:"):
+            return None
+        data = line[len("data:"):].strip()
+        if data == "[DONE]":
+            return _SSE_DONE
+        try:
+            obj = json.loads(data)
+            return obj["choices"][0]["delta"].get("content") or None
+        except (json.JSONDecodeError, KeyError, IndexError):
+            return None
+
+    def _raise_openai_status(self, resp) -> None:
+        if resp.status_code == 429:
+            raise LLMResponseError(
+                "OpenAI API rate limit hit (429); wait and retry, or switch backend"
+            )
+        detail = ""
+        try:
+            detail = resp.json().get("error", {}).get("message", "")
+        except (json.JSONDecodeError, ValueError, AttributeError):
+            detail = resp.text[:200]
+        raise LLMResponseError(
+            f"OpenAI API error {resp.status_code}: {detail or 'unknown error'}"
         )
 
     # -- helpers ---------------------------------------------------------------

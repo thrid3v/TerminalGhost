@@ -41,8 +41,10 @@ def project(tmp_path):
 
 
 def test_assemble_includes_all_sections(db, project):
-    db.insert_command(make_event("make build", exit_code=1, output="Error 1"))
-    db.insert_command(make_event("cat Makefile"))
+    db.insert_command(
+        make_event("make build", exit_code=1, output="Error 1", cwd=str(project))
+    )
+    db.insert_command(make_event("cat Makefile", cwd=str(project)))
     assembler = ContextAssembler(db, Config())
     prompt = assembler.assemble(str(project), "why did it fail")
 
@@ -53,6 +55,16 @@ def test_assemble_includes_all_sections(db, project):
     assert "Makefile" in prompt  # directory tree
     assert "src/" in prompt
     assert "User note" in prompt and "why did it fail" in prompt
+
+
+def test_assemble_scopes_error_to_cwd(db, project):
+    # A failure in another directory must NOT surface for a ?? asked here.
+    db.insert_command(
+        make_event("make build", exit_code=1, output="Error 1", cwd="/elsewhere")
+    )
+    assembler = ContextAssembler(db, Config())
+    prompt = assembler.assemble(str(project))
+    assert "FAILING" not in prompt
 
 
 def test_assemble_without_error_or_note(db, project):

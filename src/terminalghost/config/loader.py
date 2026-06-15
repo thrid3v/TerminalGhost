@@ -23,6 +23,7 @@ log = logging.getLogger(__name__)
 DEFAULT_CONFIG_PATH = os.path.join("~", ".config", "terminalghost", "config.toml")
 
 VALID_BACKENDS = ("ollama", "claude", "openai")
+VALID_COLOR_MODES = ("auto", "always", "never")
 
 
 class ConfigError(Exception):
@@ -46,14 +47,20 @@ class ClaudeConfig:
 
 @dataclass(frozen=True)
 class OpenAIConfig:
-    api_key: str = ""  # stub backend — not implemented yet
-    model: str = "gpt-4o"
+    api_key: str = ""  # prefer OPENAI_API_KEY env var
+    model: str = "gpt-4o-mini"
+    # OpenAI-compatible endpoint — point this at Groq, LM Studio, llama.cpp, etc.
+    base_url: str = "https://api.openai.com/v1"
+    max_tokens: int = 1024
 
 
 @dataclass(frozen=True)
 class LLMConfig:
     backend: str = "ollama"
     allow_inline_context: bool = True
+    # Seconds a previous ?? answer stays in context for follow-up questions
+    # (0 disables conversational follow-ups).
+    followup_seconds: int = 300
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
     claude: ClaudeConfig = field(default_factory=ClaudeConfig)
     openai: OpenAIConfig = field(default_factory=OpenAIConfig)
@@ -67,6 +74,12 @@ class CaptureConfig:
     )
     max_output_bytes: int = 4096
     use_pty: bool = False
+    # Store command output when a hook sends it (opt-in; needs TG_CAPTURE_OUTPUT=1
+    # in the POSIX hooks). Acts as a privacy gate: when false, any output a hook
+    # sends is dropped before storage.
+    capture_output: bool = False
+    # Keep only the last N lines of captured output (before max_output_bytes).
+    output_max_lines: int = 40
 
 
 @dataclass(frozen=True)
@@ -89,11 +102,22 @@ class GeneralConfig:
 
 
 @dataclass(frozen=True)
+class UIConfig:
+    # Color policy for terminal output: "auto" (color iff TTY), "always", "never".
+    color: str = "auto"
+    # Show the brand banner on init/start.
+    banner: bool = True
+    # Render streamed ?? answers as live markdown (vs. plain streamed text).
+    markdown: bool = True
+
+
+@dataclass(frozen=True)
 class Config:
     general: GeneralConfig = field(default_factory=GeneralConfig)
     capture: CaptureConfig = field(default_factory=CaptureConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
+    ui: UIConfig = field(default_factory=UIConfig)
 
 
 def load_config(path: str | None = None) -> Config:
@@ -243,8 +267,15 @@ def _validate(raw: dict) -> None:
     if port is not None:
         if not _is_int(port):
             raise ConfigError(f"general.port must be an integer, got {port!r}")
-        if not 1024 <= port <= 65535:
-            raise ConfigError(f"general.port must be in [1024, 65535], got {port}")
+        # 0 = "pick a free port" (the daemon writes the chosen one to a runtime file).
+        if port != 0 and not 1024 <= port <= 65535:
+            raise ConfigError(f"general.port must be 0 or in [1024, 65535], got {port}")
+
+    color = _get(raw, "ui", "color")
+    if color is not None and color not in VALID_COLOR_MODES:
+        raise ConfigError(
+            f"ui.color must be one of {VALID_COLOR_MODES}, got {color!r}"
+        )
 
 
 def _make(cls, section) -> object:
@@ -303,4 +334,6 @@ def _build_config(raw: dict) -> Config:
         openai=_make(OpenAIConfig, llm_raw.get("openai")),  # type: ignore[arg-type]
     )
 
-    return Config(general=general, capture=capture, context=context, llm=llm)
+    ui: UIConfig = _make(UIConfig, raw.get("ui"))  # type: ignore[assignment]
+
+    return Config(general=general, capture=capture, context=context, llm=llm, ui=ui)

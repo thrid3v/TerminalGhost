@@ -1,10 +1,10 @@
-# Runtime dependencies — keep in sync with pyproject.toml [project.dependencies]
-# (prefer `pip install -e ".[dev]"`, which reads pyproject.toml directly)
+# Runtime dependencies — keep in sync with pyproject.toml [project.dependencies].
+# Prefer installing via pyproject: `pipx install terminalghost` (users) or
+# `pip install -e ".[dev,cloud]"` (development), which read pyproject.toml directly.
 httpx>=0.27
-anthropic>=0.30
 psutil>=6.0
+rich>=13.7
 
-# Dev / test dependencies — pyproject.toml [project.optional-dependencies] dev
-pytest>=8.2
-pytest-asyncio>=0.23
-pytest-cov>=5.0
+# Optional extras (pyproject [project.optional-dependencies]):
+#   cloud  -> anthropic>=0.30   (only for the Claude backend)
+#   dev    -> pytest, pytest-asyncio, pytest-cov, ruff, build
