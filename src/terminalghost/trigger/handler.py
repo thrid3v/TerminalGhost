@@ -206,6 +206,11 @@ class TriggerHandler:
                 stripped = line.strip().lstrip("$").strip()
                 if stripped and not stripped.startswith("#"):
                     return stripped
+        # A "$ command" prompt line in prose (common when the model skips fences).
+        for line in answer.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("$ "):
+                return stripped[2:].strip()
         inline = cls._INLINE_RE.search(answer)
         if inline:
             return inline.group(1).strip()

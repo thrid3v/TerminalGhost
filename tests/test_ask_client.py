@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 
 from terminalghost.config.loader import Config
-from terminalghost.daemon.process import (
+from terminalghost.cli.client import (
     _answering_model,
     _iter_socket_text,
     _render_answer_plain,
