@@ -110,3 +110,8 @@ add-zsh-hook precmd _tg_precmd
 '??'() {
   terminalghost ask "$@"
 }
+
+# tgr <cmd> — run a command with its output captured for the next ??.
+# tga — run the command TerminalGhost last suggested (asks first).
+tgr() { terminalghost exec "$@" }
+tga() { terminalghost apply "$@" }

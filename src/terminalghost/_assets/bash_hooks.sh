@@ -125,3 +125,8 @@ PROMPT_COMMAND="_tg_precmd${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
 # the cwd it wins. `tg` is provided as an unambiguous fallback.
 function ?? { terminalghost ask "$@"; }
 function tg { terminalghost ask "$@"; }
+
+# tgr <cmd> — run a command with its output captured for the next ??.
+# tga — run the command TerminalGhost last suggested (asks first).
+function tgr { terminalghost exec "$@"; }
+function tga { terminalghost apply "$@"; }

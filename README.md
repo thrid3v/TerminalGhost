@@ -54,6 +54,28 @@ PowerShell 5.1 gets both). In **bash**, `??` can glob; `tg` is an unambiguous al
 
 Add `-c`/`--copy` (e.g. `tg --copy fix`) to copy the answer to your clipboard.
 
+## Capture output & apply fixes
+
+By default the model sees your command and exit code but not its output. To give
+it the real error text on **any platform**, run the command through the capture
+wrapper:
+
+```
+tgr make build      # runs it normally, mirrors output, captures it for the next qq
+qq                  # now reasons from the actual error, not just the command
+```
+
+When the answer suggests a command, run it without retyping:
+
+```
+tga                 # shows the suggested command, asks y/N, then runs it (also captured)
+```
+
+`tgr` = `terminalghost exec`, `tga` = `terminalghost apply`. The applied command
+runs through the same capture path, so you can immediately `qq` again if it fails.
+(For zero-effort ambient capture on Linux/macOS, see the experimental
+`TG_CAPTURE_OUTPUT` option below.)
+
 ## Commands
 
 ```
@@ -67,6 +89,8 @@ terminalghost log [-n N]  # show recently captured commands
 terminalghost enable      # start the daemon automatically at login
 terminalghost disable     # undo enable
 terminalghost uninstall   # remove the shell hook block from your profile
+terminalghost exec <cmd>  # run a command, capturing its output for ?? (alias: tgr)
+terminalghost apply       # run the command ?? last suggested (alias: tga)
 terminalghost --version
 ```
 

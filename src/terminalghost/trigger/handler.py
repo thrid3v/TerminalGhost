@@ -60,9 +60,15 @@ class TriggerHandler:
         self._lock = asyncio.Lock()
         # Last (monotonic_ts, question, answer) for short conversational follow-ups.
         self._last_exchange: tuple[float, str, str] | None = None
+        # Last (monotonic_ts, command) extracted from an answer, for `apply`.
+        self._last_suggestion: tuple[float, str] | None = None
 
     _INTENTS = ("fix", "explain")
     _MAX_STORED_ANSWER = 2000
+    _SUGGESTION_TTL = 600.0  # how long a suggested command stays applyable
+
+    _FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
+    _INLINE_RE = re.compile(r"`([^`\n]+)`")
 
     def set_backend(self, backend: "LLMBackend") -> None:
         """Swap the LLM backend (used by SIGHUP config hot-reload)."""
@@ -127,7 +133,9 @@ class TriggerHandler:
                 )
                 if decorate:
                     await emit("\n")
-                self._record_exchange(raw_inline or "??", "".join(collected))
+                answer = "".join(collected)
+                self._record_exchange(raw_inline or "??", answer)
+                self._record_suggestion(answer)
             except LLMError as exc:
                 await emit(f"\nTerminalGhost error: {exc}\n")
 
@@ -182,6 +190,40 @@ class TriggerHandler:
             question,
             answer[: self._MAX_STORED_ANSWER],
         )
+
+    # -- apply-the-fix ---------------------------------------------------------
+
+    @classmethod
+    def _extract_command(cls, answer: str) -> str | None:
+        """Pull the first runnable command out of an answer.
+
+        Prefers a fenced code block (the first non-comment line), falling back
+        to the first inline-code span. Returns None if neither is present.
+        """
+        fence = cls._FENCE_RE.search(answer)
+        if fence:
+            for line in fence.group(1).splitlines():
+                stripped = line.strip().lstrip("$").strip()
+                if stripped and not stripped.startswith("#"):
+                    return stripped
+        inline = cls._INLINE_RE.search(answer)
+        if inline:
+            return inline.group(1).strip()
+        return None
+
+    def _record_suggestion(self, answer: str) -> None:
+        command = self._extract_command(answer)
+        if command:
+            self._last_suggestion = (time.monotonic(), command)
+
+    def last_suggestion(self) -> str | None:
+        """The most recent suggested command, if still fresh."""
+        if self._last_suggestion is None:
+            return None
+        ts, command = self._last_suggestion
+        if time.monotonic() - ts > self._SUGGESTION_TTL:
+            return None
+        return command
 
     async def _stream_to(self, stream: AsyncIterator[str], emit: SendFn) -> None:
         """Consume the LLM stream, leaving the output clean on interrupt."""

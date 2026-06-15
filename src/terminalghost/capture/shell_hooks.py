@@ -37,6 +37,8 @@ OnEvent = Callable[[CommandEvent, int | None, str | None], Awaitable[None]]
 OnQuery = Callable[[str, str, Callable[[str], Awaitable[None]]], Awaitable[None]]
 # on_hint(cwd, send) — stream a one-line proactive hint (or nothing)
 OnHint = Callable[[str, Callable[[str], Awaitable[None]]], Awaitable[None]]
+# on_suggestion(send) — write back the last suggested command (or nothing)
+OnSuggestion = Callable[[Callable[[str], Awaitable[None]]], Awaitable[None]]
 
 
 class HookReceiver:
@@ -49,12 +51,14 @@ class HookReceiver:
         on_event: OnEvent,
         on_query: OnQuery | None = None,
         on_hint: OnHint | None = None,
+        on_suggestion: OnSuggestion | None = None,
     ) -> None:
         self._host = host
         self._port = port
         self._on_event = on_event
         self._on_query = on_query
         self._on_hint = on_hint
+        self._on_suggestion = on_suggestion
         self._server: asyncio.Server | None = None
 
     @property
@@ -120,6 +124,9 @@ class HookReceiver:
                 if obj.get("type") == "hint":
                     await self._handle_hint(obj, writer)
                     break
+                if obj.get("type") == "suggestion":
+                    await self._handle_suggestion(writer)
+                    break
                 try:
                     event, shell_pid, shell = self._parse_payload(text)
                 except ValueError as exc:
@@ -168,6 +175,20 @@ class HookReceiver:
             await self._on_hint(cwd, send)
         except ConnectionError:
             log.info("hint client disconnected mid-response")
+
+    async def _handle_suggestion(self, writer: asyncio.StreamWriter) -> None:
+        """Write back the last suggested command (empty if none)."""
+        if self._on_suggestion is None:
+            return
+
+        async def send(text: str) -> None:
+            writer.write(text.encode("utf-8", errors="replace"))
+            await writer.drain()
+
+        try:
+            await self._on_suggestion(send)
+        except ConnectionError:
+            log.info("suggestion client disconnected")
 
     # -- payload parsing -----------------------------------------------------------
 
@@ -219,6 +240,10 @@ class HookReceiver:
         if output is not None and not isinstance(output, str):
             raise ValueError("output must be a string when present")
 
+        source = obj.get("source")
+        if source is not None and not isinstance(source, str):
+            raise ValueError("source must be a string when present")
+
         event = CommandEvent(
             session_id=0,  # resolved by the daemon from shell_pid
             ts=float(ts),
@@ -227,5 +252,6 @@ class HookReceiver:
             exit_code=exit_code,
             duration_ms=duration,
             output=output,
+            source=source,
         )
         return event, shell_pid, shell

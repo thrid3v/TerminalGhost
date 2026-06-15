@@ -66,6 +66,11 @@ function global:prompt {
 
 function global:qq { terminalghost ask @args }
 
+# tgr <cmd> — run a command with its output captured for the next qq/??.
+# tga — run the command TerminalGhost last suggested (asks first).
+function global:tgr { terminalghost exec @args }
+function global:tga { terminalghost apply @args }
+
 # `??` works as a function name in Windows PowerShell 5.1; in PowerShell 7+
 # it collides with the null-coalescing operator, so it is defined only where
 # it parses (use `qq` otherwise).

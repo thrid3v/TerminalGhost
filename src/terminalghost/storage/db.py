@@ -37,6 +37,9 @@ class CommandEvent:
     duration_ms: int
     output: str | None = None
     id: int | None = None  # database row ID; None before INSERT
+    # Where the event came from: None/"hook" (ambient) or "run" (explicit
+    # `terminalghost exec`). Not persisted; governs the output privacy gate.
+    source: str | None = None
 
 
 _COLUMNS = "id, session_id, ts, cwd, cmd, exit_code, duration_ms, output"
