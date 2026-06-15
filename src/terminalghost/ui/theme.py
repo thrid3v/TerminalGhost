@@ -8,9 +8,10 @@ from __future__ import annotations
 
 from rich.theme import Theme
 
-# The ghost marker shown before answers and in the banner. Box-drawing-safe;
-# Rich substitutes a fallback on consoles that cannot encode it.
-GHOST_GLYPH = "▟"
+# The ghost mascot shown before answers and in the banner. CLI output is forced
+# to UTF-8 (see daemon.process._force_utf8_io), so the emoji renders on modern
+# terminals and degrades to a replacement char (never a crash) on legacy ones.
+GHOST_GLYPH = "👻"
 
 TG_THEME = Theme(
     {
