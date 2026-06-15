@@ -1,0 +1,11 @@
+# Normalize line endings: text files are LF in the repo.
+* text=auto eol=lf
+
+# Shell hooks MUST stay LF even on Windows checkouts (they're sourced by
+# bash/zsh and shipped in the wheel).
+*.sh text eol=lf
+*.ps1 text eol=lf
+
+# Binary-ish: never normalize
+*.png binary
+*.db binary

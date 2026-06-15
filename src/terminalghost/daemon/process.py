@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ipaddress
 import json
 import logging
 import os
@@ -74,6 +75,7 @@ class Daemon:
                 max_output_bytes=self._config.capture.max_output_bytes,
             )
             self._db.open()
+            _assert_safe_host(general.host)
             backend = get_backend(self._config)
             assembler = ContextAssembler(self._db, self._config)
             self._trigger = TriggerHandler(self._db, assembler, backend, self._config)
@@ -241,6 +243,31 @@ class Daemon:
             pass
 
 
+def _is_loopback(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _assert_safe_host(host: str) -> None:
+    """Refuse to expose the daemon off-machine.
+
+    The loopback socket is unauthenticated by design (local-trust model), so
+    binding a routable address would hand shell history + LLM access to the
+    network. Require an explicit opt-in for that.
+    """
+    if _is_loopback(host) or os.environ.get("TG_ALLOW_REMOTE") == "1":
+        return
+    raise RuntimeError(
+        f"refusing to bind non-loopback host {host!r}: this would expose your "
+        "shell history and LLM to the network with no authentication. Use a "
+        "loopback host (127.0.0.1), or set TG_ALLOW_REMOTE=1 to override."
+    )
+
+
 def _trim_output(output: str, max_lines: int) -> str:
     """Keep only the last `max_lines` lines (errors are usually at the end)."""
     lines = output.splitlines()
@@ -249,27 +276,44 @@ def _trim_output(output: str, max_lines: int) -> str:
     return "\n".join(lines)
 
 
-# Secret-bearing command patterns, redacted before storage so they never reach
-# the database or a cloud LLM.
+# Secret-bearing patterns, redacted before storage so they never reach the
+# database or a cloud LLM. Applied to both command text and captured output.
 _SECRET_ASSIGN_RE = re.compile(
     r"(?i)\b([A-Z0-9_]*(?:PASSWORD|PASSWD|TOKEN|SECRET|API[_-]?KEY)[A-Z0-9_]*)=(\S+)"
 )
 _SECRET_FLAG_RE = re.compile(
     r"(?i)(--?(?:password|passwd|pass|token|secret|api[_-]?key)[=\s])(\S+)"
 )
+_BEARER_RE = re.compile(r"(?i)(bearer\s+)([A-Za-z0-9._\-]{8,})")
 _URL_CRED_RE = re.compile(r"([a-z][a-z0-9+.\-]*://[^:@/\s]+):([^@/\s]+)@")
+# Well-known token literals (GitHub, OpenAI/Anthropic, Slack, AWS access keys).
+_TOKEN_LITERAL_RE = re.compile(
+    r"\b("
+    r"gh[opsu]_[A-Za-z0-9]{20,}"
+    r"|sk-(?:ant-)?[A-Za-z0-9_\-]{16,}"
+    r"|xox[baprs]-[A-Za-z0-9\-]{10,}"
+    r"|AKIA[0-9A-Z]{16}"
+    r")\b"
+)
+
+
+def _redact_secrets(text: str) -> str:
+    """Redact obvious secrets (assignments, flags, bearer tokens, URL creds,
+    well-known key literals) anywhere in `text`."""
+    text = _SECRET_ASSIGN_RE.sub(r"\1=<redacted>", text)
+    text = _SECRET_FLAG_RE.sub(r"\1<redacted>", text)
+    text = _BEARER_RE.sub(r"\1<redacted>", text)
+    text = _TOKEN_LITERAL_RE.sub("<redacted>", text)
+    text = _URL_CRED_RE.sub(r"\1:<redacted>@", text)
+    return text
 
 
 def _redact_command(cmd: str) -> str:
-    """Redact obvious secrets in a command line (assignments, flags, URL creds)."""
-    cmd = _SECRET_ASSIGN_RE.sub(r"\1=<redacted>", cmd)
-    cmd = _SECRET_FLAG_RE.sub(r"\1<redacted>", cmd)
-    cmd = _URL_CRED_RE.sub(r"\1:<redacted>@", cmd)
-    return cmd
+    return _redact_secrets(cmd)
 
 
 def _redact_output(output: str) -> str:
-    """Replace lines that look like password/secret prompts or values."""
+    """Mask secret-looking value lines, then redact token literals everywhere."""
     sensitive = re.compile(r"(?i)\b(password|passphrase|token|secret|api[-_]?key)\b")
     redacted = []
     suppress_next = False
@@ -282,7 +326,7 @@ def _redact_output(output: str) -> str:
             suppress_next = True  # the following line is often the echoed value
         else:
             redacted.append(line)
-    return "\n".join(redacted)
+    return _redact_secrets("\n".join(redacted))
 
 
 def _read_pid(path: str) -> int | None:
@@ -714,23 +758,33 @@ def _cmd_exec(config: Config, argv: list[str]) -> int:
     return rc
 
 
-def _fetch_suggestion(config: Config) -> str:
-    """Ask the daemon for the last suggested command (empty string if none)."""
+def _request(config: Config, obj: dict, connect_timeout: float = 3.0,
+             read_timeout: float = 5.0) -> str:
+    """Send one JSON request to the daemon and return the full text response.
+
+    Returns "" on any connection problem — callers treat that as "no answer".
+    """
+    payload = (json.dumps(obj) + "\n").encode("utf-8")
     data = b""
     try:
         with socket.create_connection(
-            (config.general.host, _effective_port(config)), timeout=3
+            (config.general.host, _effective_port(config)), timeout=connect_timeout
         ) as sock:
-            sock.sendall((json.dumps({"type": "suggestion"}) + "\n").encode("utf-8"))
-            sock.settimeout(5)
+            sock.sendall(payload)
+            sock.settimeout(read_timeout)
             while True:
                 chunk = sock.recv(4096)
                 if not chunk:
                     break
                 data += chunk
-    except OSError:
+    except (OSError, KeyboardInterrupt):
         return ""
     return data.decode("utf-8", errors="replace").strip()
+
+
+def _fetch_suggestion(config: Config) -> str:
+    """Ask the daemon for the last suggested command (empty string if none)."""
+    return _request(config, {"type": "suggestion"})
 
 
 def _cmd_apply(config: Config, assume_yes: bool = False) -> int:
@@ -799,24 +853,12 @@ def _cmd_hint(config: Config) -> int:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except (AttributeError, OSError):
         pass
-    payload = json.dumps({"type": "hint", "cwd": os.getcwd()}) + "\n"
-    data = b""
-    try:
-        with socket.create_connection(
-            (config.general.host, _effective_port(config)), timeout=2
-        ) as sock:
-            sock.sendall(payload.encode("utf-8"))
-            sock.settimeout(HINT_TIMEOUT)
-            while True:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
-    except (OSError, KeyboardInterrupt):
-        return 0  # never disrupt the prompt
-    text = data.decode("utf-8", errors="replace").strip()
+    text = _request(
+        config, {"type": "hint", "cwd": os.getcwd()},
+        connect_timeout=2, read_timeout=HINT_TIMEOUT,
+    )
     if not text:
-        return 0
+        return 0  # daemon down / no hint — never disrupt the prompt
     from rich.markup import escape
 
     from terminalghost.ui import get_console
