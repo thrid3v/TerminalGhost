@@ -40,6 +40,15 @@ log = logging.getLogger(__name__)
 DATA_DIR = os.path.join("~", ".local", "share", "terminalghost")
 LOG_FILE = os.path.join(DATA_DIR, "daemon.log")
 
+# Client read timeout for `ask`: large enough for a cold model's first token,
+# small enough that a wedged daemon doesn't hang the prompt forever.
+ASK_IDLE_TIMEOUT = 300.0
+# Proactive hint: short read timeout so a cold/slow model just yields no hint
+# rather than stalling the user's prompt.
+HINT_TIMEOUT = 12.0
+# Rotate the daemon log once it grows past this many bytes.
+LOG_MAX_BYTES = 5 * 1024 * 1024
+
 
 class Daemon:
     """Orchestrates lifecycle and wiring; no business logic lives here."""
@@ -72,12 +81,17 @@ class Daemon:
                 general.port,
                 on_event=self._on_event,
                 on_query=self._on_query,
+                on_hint=self._on_hint,
             )
             await receiver.start()
+            # Record the actually-bound port so clients can find us even when
+            # general.port == 0 (ephemeral).
+            _write_port_file(self._config, receiver.port)
 
             shutdown = asyncio.Event()
             self._install_signal_handlers(asyncio.get_running_loop(), shutdown)
-            log.info("daemon running (pid %d)", os.getpid())
+            log.info("daemon running (pid %d) on %s:%d", os.getpid(),
+                     general.host, receiver.port)
             await shutdown.wait()
             log.info("shutdown requested")
         finally:
@@ -91,6 +105,7 @@ class Daemon:
             if self._db is not None:
                 self._db.close()
             self._remove_pid_file(general.pid_file)
+            _remove_port_file(self._config)
 
     # -- event wiring ------------------------------------------------------------
 
@@ -100,10 +115,18 @@ class Daemon:
         """Persist a command event (with capture-policy filtering applied)."""
         assert self._db is not None
         event.session_id = self._session_for(shell_pid, shell)
-        if self._is_blocked(event.cmd):
-            event.output = None  # never store output of blocked commands
-        if self._config.capture.redact_passwords and event.output:
-            event.output = _redact_output(event.output)
+        cap = self._config.capture
+        # Output: privacy gate first (drop entirely unless explicitly enabled and
+        # the command isn't blocked), then trim + redact what remains.
+        if not cap.capture_output or self._is_blocked(event.cmd):
+            event.output = None
+        elif event.output:
+            event.output = _trim_output(event.output, cap.output_max_lines)
+            if cap.redact_passwords:
+                event.output = _redact_output(event.output)
+        # Redact secrets that live in the command text itself (tokens, creds-in-URLs).
+        if cap.redact_passwords:
+            event.cmd = _redact_command(event.cmd)
         self._db.insert_command(event)
 
     async def _on_query(self, cmd: str, cwd: str, send) -> None:
@@ -120,6 +143,11 @@ class Daemon:
             )
         )
         await self._trigger.handle(cmd, cwd, send=send)
+
+    async def _on_hint(self, cwd: str, send) -> None:
+        """Stream a one-line proactive hint (best-effort; records nothing)."""
+        assert self._trigger is not None
+        await self._trigger.hint(cwd, send)
 
     def _session_for(self, shell_pid: int | None, shell: str | None) -> int:
         assert self._db is not None
@@ -199,6 +227,33 @@ class Daemon:
             pass
 
 
+def _trim_output(output: str, max_lines: int) -> str:
+    """Keep only the last `max_lines` lines (errors are usually at the end)."""
+    lines = output.splitlines()
+    if max_lines > 0 and len(lines) > max_lines:
+        lines = lines[-max_lines:]
+    return "\n".join(lines)
+
+
+# Secret-bearing command patterns, redacted before storage so they never reach
+# the database or a cloud LLM.
+_SECRET_ASSIGN_RE = re.compile(
+    r"(?i)\b([A-Z0-9_]*(?:PASSWORD|PASSWD|TOKEN|SECRET|API[_-]?KEY)[A-Z0-9_]*)=(\S+)"
+)
+_SECRET_FLAG_RE = re.compile(
+    r"(?i)(--?(?:password|passwd|pass|token|secret|api[_-]?key)[=\s])(\S+)"
+)
+_URL_CRED_RE = re.compile(r"([a-z][a-z0-9+.\-]*://[^:@/\s]+):([^@/\s]+)@")
+
+
+def _redact_command(cmd: str) -> str:
+    """Redact obvious secrets in a command line (assignments, flags, URL creds)."""
+    cmd = _SECRET_ASSIGN_RE.sub(r"\1=<redacted>", cmd)
+    cmd = _SECRET_FLAG_RE.sub(r"\1<redacted>", cmd)
+    cmd = _URL_CRED_RE.sub(r"\1:<redacted>@", cmd)
+    return cmd
+
+
 def _redact_output(output: str) -> str:
     """Replace lines that look like password/secret prompts or values."""
     sensitive = re.compile(r"(?i)\b(password|passphrase|token|secret|api[-_]?key)\b")
@@ -224,15 +279,67 @@ def _read_pid(path: str) -> int | None:
         return None
 
 
+def _port_file_path(config: Config) -> str:
+    """Runtime file holding the daemon's actually-bound port (next to the PID)."""
+    return os.path.join(os.path.dirname(os.path.abspath(config.general.pid_file)), "port")
+
+
+def _write_port_file(config: Config, port: int) -> None:
+    path = _port_file_path(config)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="ascii") as fh:
+            fh.write(str(port))
+    except OSError:
+        pass  # best-effort; clients fall back to the configured port
+
+
+def _remove_port_file(config: Config) -> None:
+    try:
+        os.remove(_port_file_path(config))
+    except FileNotFoundError:
+        pass
+
+
+def _effective_port(config: Config) -> int:
+    """Port a client should connect to: the configured one, or — when that is 0
+    (ephemeral) — the bound port the daemon wrote to its runtime file."""
+    if config.general.port != 0:
+        return config.general.port
+    try:
+        with open(_port_file_path(config), encoding="ascii") as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return config.general.port
+
+
 # -- CLI ------------------------------------------------------------------------------
 
 
+def _force_utf8_io() -> None:
+    """Make stdout/stderr UTF-8 so Rich never crashes on a legacy Windows
+    console (cp1252) when emitting ✓, box-drawing, or model output."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError):
+            pass  # non-reconfigurable stream (e.g. a pipe wrapper) — best effort
+
+
 def main() -> None:
+    from terminalghost import __version__
+
+    _force_utf8_io()
     parser = argparse.ArgumentParser(
         prog="terminalghost",
         description="Local-first terminal AI assistant daemon",
     )
     parser.add_argument("--config", help="explicit config file path", default=None)
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"terminalghost {__version__}",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("start", help="start the daemon in the background")
     sub.add_parser("stop", help="stop the running daemon")
@@ -241,7 +348,26 @@ def main() -> None:
     sub.add_parser("run", help="run the daemon in the foreground (used by start)")
     ask = sub.add_parser("ask", help="send a ?? query to the daemon and print the answer")
     ask.add_argument("text", nargs="*", help="optional extra context after ??")
+    ask.add_argument("-c", "--copy", action="store_true",
+                     help="copy the answer to the clipboard")
+
+    sub.add_parser("hint", help="print a one-line proactive hint for the last failure")
+    sub.add_parser("init", help="interactive first-time setup wizard")
+    sub.add_parser("doctor", help="diagnose the installation and print fixes")
+    log_p = sub.add_parser("log", help="show recently captured commands")
+    log_p.add_argument("-n", "--limit", type=int, default=20, help="how many to show")
+    hp = sub.add_parser("hook-path", help="print the path to a bundled shell hook script")
+    hp.add_argument("shell", help="shell name (zsh | bash | powershell)")
+    uninst = sub.add_parser("uninstall", help="remove the TerminalGhost block from your shell profile")
+    uninst.add_argument("--shell", help="shell to uninstall from (default: autodetect)")
+    enable = sub.add_parser("enable", help="start the daemon automatically at login")
+    enable.add_argument("--shell", help=argparse.SUPPRESS)
+    sub.add_parser("disable", help="stop starting the daemon at login")
     args = parser.parse_args()
+
+    # hook-path must stay silent + dependency-free: it runs on every shell start.
+    if args.command == "hook-path":
+        sys.exit(_cmd_hook_path(args.shell))
 
     try:
         config = load_config(args.config)
@@ -262,7 +388,52 @@ def main() -> None:
         _cmd_stop(config)
         sys.exit(_cmd_start(config, args.config))
     elif command == "ask":
-        sys.exit(_cmd_ask(config, " ".join(args.text)))
+        sys.exit(_cmd_ask(config, " ".join(args.text), copy=args.copy))
+    elif command == "hint":
+        sys.exit(_cmd_hint(config))
+    elif command == "init":
+        from terminalghost.cli.init import cmd_init
+
+        sys.exit(cmd_init(config, args.config))
+    elif command == "doctor":
+        from terminalghost.cli.doctor import cmd_doctor
+
+        sys.exit(cmd_doctor(config))
+    elif command == "log":
+        from terminalghost.cli.logview import cmd_log
+
+        sys.exit(cmd_log(config, args.limit))
+    elif command == "uninstall":
+        from terminalghost.cli.init import cmd_uninstall
+
+        sys.exit(cmd_uninstall(config, args.shell))
+    elif command == "enable":
+        from terminalghost.cli.autostart import cmd_enable
+
+        sys.exit(cmd_enable(config))
+    elif command == "disable":
+        from terminalghost.cli.autostart import cmd_disable
+
+        sys.exit(cmd_disable(config))
+
+
+def _cmd_hook_path(shell: str) -> int:
+    """Print the absolute path to the bundled hook script for `shell`.
+
+    Sourced by the profile block on every shell start, so it must print only
+    the path (no banner/log) and never import heavy modules.
+    """
+    from terminalghost._assets import HOOK_FILES, hook_path
+
+    key = shell.strip().lower()
+    if key not in HOOK_FILES:
+        print(
+            f"unknown shell {shell!r}; expected one of {sorted(set(HOOK_FILES))}",
+            file=sys.stderr,
+        )
+        return 1
+    print(hook_path(key))
+    return 0
 
 
 def _cmd_run(config: Config, config_path: str | None) -> None:
@@ -294,6 +465,7 @@ def _cmd_start(config: Config, config_path: str | None) -> int:
         return 1
     log_path = os.path.expanduser(LOG_FILE)
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    _rotate_log(log_path)
     cmd = [sys.executable, "-m", "terminalghost.daemon.process"]
     if config_path:
         cmd += ["--config", config_path]
@@ -321,9 +493,43 @@ def _cmd_start(config: Config, config_path: str | None) -> int:
     if proc.poll() is not None:
         print(f"daemon failed to start; see {log_path}", file=sys.stderr)
         return 1
-    print(f"daemon started (pid {proc.pid}), listening on "
-          f"{config.general.host}:{config.general.port}")
+    _show_banner(config)
+    from terminalghost.ui import get_console
+
+    console = get_console(color=config.ui.color)
+    port = _effective_port(config)  # resolves the bound port when general.port == 0
+    console.print(
+        f"[tg.success]✓[/] daemon started (pid {proc.pid}), listening on "
+        f"[tg.key]{config.general.host}:{port}[/]"
+    )
     return 0
+
+
+def _rotate_log(log_path: str, max_bytes: int = LOG_MAX_BYTES) -> None:
+    """Rename the daemon log to .1 once it grows too large (keeps one backup)."""
+    try:
+        if os.path.getsize(log_path) < max_bytes:
+            return
+    except OSError:
+        return
+    backup = log_path + ".1"
+    try:
+        if os.path.exists(backup):
+            os.remove(backup)
+        os.replace(log_path, backup)
+    except OSError:
+        pass
+
+
+def _show_banner(config: Config) -> None:
+    """Print the brand banner unless disabled in config."""
+    if not config.ui.banner:
+        return
+    from terminalghost import __version__
+    from terminalghost.ui import get_console, render_banner
+
+    console = get_console(color=config.ui.color)
+    console.print(render_banner(__version__, backend=config.llm.backend))
 
 
 def _cmd_stop(config: Config) -> int:
@@ -354,11 +560,34 @@ def _cmd_status(config: Config) -> int:
     return 0
 
 
-def _cmd_ask(config: Config, text: str) -> int:
-    """Send a ?? query to the daemon and stream the answer to this terminal.
+def _answering_model(config: Config) -> str:
+    """The model name the configured backend will answer with (for the footer)."""
+    backend = config.llm.backend
+    if backend == "ollama":
+        return config.llm.ollama.model
+    if backend == "claude":
+        return config.llm.claude.model
+    if backend == "openai":
+        return config.llm.openai.model
+    return backend
+
+
+def _iter_socket_text(sock: socket.socket):
+    """Yield decoded text chunks from the daemon's streamed answer until EOF."""
+    while True:
+        data = sock.recv(4096)
+        if not data:
+            return
+        yield data.decode("utf-8", errors="replace")
+
+
+def _cmd_ask(config: Config, text: str, copy: bool = False) -> int:
+    """Send a ?? query to the daemon and render the streamed answer.
 
     This is the client end of the response channel: it runs in the user's
-    terminal, so writing to its stdout is what makes the answer visible.
+    terminal, so writing to its stdout is what makes the answer visible. With
+    a TTY it renders the answer as live markdown with a spinner + footer;
+    otherwise it streams plain text (pipes, NO_COLOR, ui.markdown = false).
     """
     # Windows consoles may default to a legacy codepage (cp1252) that cannot
     # encode characters the LLM (or our header) emits; force UTF-8 output.
@@ -366,30 +595,190 @@ def _cmd_ask(config: Config, text: str) -> int:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except (AttributeError, OSError):
         pass  # non-reconfigurable stream (e.g. pipe wrapper) — best effort
+
+    from terminalghost.ui import resolve_color
+
     cmd = "??" if not text else f"?? {text}"
     payload = json.dumps({"type": "query", "cmd": cmd, "cwd": os.getcwd()}) + "\n"
+    use_rich = config.ui.markdown and resolve_color(config.ui.color, sys.stdout)
+
     try:
-        with socket.create_connection(
-            (config.general.host, config.general.port), timeout=5
-        ) as sock:
-            sock.sendall(payload.encode("utf-8"))
-            sock.settimeout(None)  # the LLM may take a while; block on reads
-            while True:
-                data = sock.recv(4096)
-                if not data:
-                    break
-                sys.stdout.write(data.decode("utf-8", errors="replace"))
-                sys.stdout.flush()
-    except (ConnectionRefusedError, socket.timeout, OSError):
-        print(
-            "TerminalGhost daemon is not reachable. Start it with: terminalghost start",
-            file=sys.stderr,
+        sock = socket.create_connection(
+            (config.general.host, _effective_port(config)), timeout=5
         )
+    except (ConnectionRefusedError, socket.timeout, OSError):
+        _print_unreachable(config)
         return 1
+
+    try:
+        with sock:
+            sock.sendall(payload.encode("utf-8"))
+            # Generous idle timeout: a cold model can take a while to first
+            # token, but a wedged daemon shouldn't freeze the prompt forever.
+            sock.settimeout(ASK_IDLE_TIMEOUT)
+            if use_rich:
+                answer = _render_answer_rich(config, sock)
+            else:
+                answer = _render_answer_plain(sock)
+        if copy and answer.strip():
+            _copy_to_clipboard(answer.strip(), config)
     except KeyboardInterrupt:
         print()
         return 130
+    except socket.timeout:
+        from terminalghost.ui import get_console
+
+        get_console(color=config.ui.color, stderr=True).print(
+            "[tg.error]TerminalGhost timed out waiting for the daemon.[/]"
+        )
+        return 1
+    except (ConnectionError, OSError):
+        _print_unreachable(config)
+        return 1
     return 0
+
+
+def _cmd_hint(config: Config) -> int:
+    """Print a one-line proactive hint for the last failure (silent otherwise).
+
+    Runs from the shell prompt when TG_HINTS is enabled, so it must never error
+    or hang: any problem (daemon down, slow model, no error) yields no output.
+    """
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
+    payload = json.dumps({"type": "hint", "cwd": os.getcwd()}) + "\n"
+    data = b""
+    try:
+        with socket.create_connection(
+            (config.general.host, _effective_port(config)), timeout=2
+        ) as sock:
+            sock.sendall(payload.encode("utf-8"))
+            sock.settimeout(HINT_TIMEOUT)
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+    except (OSError, KeyboardInterrupt):
+        return 0  # never disrupt the prompt
+    text = data.decode("utf-8", errors="replace").strip()
+    if not text:
+        return 0
+    from rich.markup import escape
+
+    from terminalghost.ui import get_console
+    from terminalghost.ui.theme import GHOST_GLYPH
+
+    line = text.splitlines()[0][:200]
+    console = get_console(color=config.ui.color)
+    console.print(f"[tg.muted]{GHOST_GLYPH} hint:[/] [tg.muted]{escape(line)}[/]")
+    return 0
+
+
+def _print_unreachable(config: Config) -> None:
+    from terminalghost.ui import get_console
+
+    console = get_console(color=config.ui.color, stderr=True)
+    console.print(
+        "[tg.error]TerminalGhost daemon is not reachable.[/] "
+        "Start it with: [tg.key]terminalghost start[/]"
+    )
+
+
+def _render_answer_plain(sock: socket.socket) -> str:
+    """Stream the raw answer to stdout (pipe / no-color path). Returns the text."""
+    sys.stdout.write("TerminalGhost ▶\n\n")
+    sys.stdout.flush()
+    collected: list[str] = []
+    for chunk in _iter_socket_text(sock):
+        collected.append(chunk)
+        sys.stdout.write(chunk)
+        sys.stdout.flush()
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    return "".join(collected)
+
+
+def _render_answer_rich(config: Config, sock: socket.socket, console=None) -> str:
+    """Render the streamed answer as live markdown with a spinner + footer.
+
+    Returns the plain answer text (for --copy)."""
+    from rich.live import Live
+    from rich.markdown import Markdown
+    from rich.spinner import Spinner
+    from rich.text import Text
+
+    from terminalghost.ui import get_console
+    from terminalghost.ui.theme import GHOST_GLYPH
+
+    if console is None:
+        console = get_console(color=config.ui.color)
+
+    header = Text()
+    header.append(f"{GHOST_GLYPH} ", style="tg.accent")
+    header.append("TerminalGhost", style="tg.brand")
+    console.print(header)
+
+    start = time.monotonic()
+    buf: list[str] = []
+    spinner = Spinner("dots", text=Text(" thinking…", style="tg.muted"))
+    with Live(
+        spinner,
+        console=console,
+        refresh_per_second=12,
+        vertical_overflow="visible",
+    ) as live:
+        for chunk in _iter_socket_text(sock):
+            buf.append(chunk)
+            live.update(Markdown("".join(buf).strip()))
+        if not buf:
+            live.update(Text("(no response)", style="tg.muted"))
+
+    elapsed = time.monotonic() - start
+    footer = Text(
+        f"{config.llm.backend} · {_answering_model(config)} · {elapsed:.1f}s",
+        style="tg.footer",
+    )
+    console.print(footer)
+    return "".join(buf)
+
+
+def _copy_to_clipboard(text: str, config: Config) -> None:
+    """Best-effort copy to the system clipboard, with a small confirmation."""
+    import shutil
+    import subprocess
+
+    from terminalghost.ui import get_console
+
+    data = text.encode("utf-8", errors="replace")
+    ok = False
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["pbcopy"], input=data, check=True)
+            ok = True
+        elif os.name == "nt":
+            subprocess.run(["clip"], input=data, check=True)
+            ok = True
+        else:
+            for tool in (
+                ["wl-copy"],
+                ["xclip", "-selection", "clipboard"],
+                ["xsel", "--clipboard", "--input"],
+            ):
+                if shutil.which(tool[0]):
+                    subprocess.run(tool, input=data, check=True)
+                    ok = True
+                    break
+    except (OSError, subprocess.CalledProcessError):
+        ok = False
+
+    console = get_console(color=config.ui.color)
+    if ok:
+        console.print("[tg.muted]copied to clipboard[/]")
+    else:
+        console.print("[tg.muted](could not access a clipboard tool)[/]")
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ import asyncio
 import logging
 import re
 import sys
+import time
 from typing import TYPE_CHECKING, AsyncIterator, Awaitable, Callable
 
 from terminalghost.llm.base import LLMError
@@ -57,6 +58,11 @@ class TriggerHandler:
         self._config = config
         # Serializes pipeline runs so two rapid ?? don't interleave output.
         self._lock = asyncio.Lock()
+        # Last (monotonic_ts, question, answer) for short conversational follow-ups.
+        self._last_exchange: tuple[float, str, str] | None = None
+
+    _INTENTS = ("fix", "explain")
+    _MAX_STORED_ANSWER = 2000
 
     def set_backend(self, backend: "LLMBackend") -> None:
         """Swap the LLM backend (used by SIGHUP config hot-reload)."""
@@ -80,11 +86,19 @@ class TriggerHandler:
     # -- pipeline ----------------------------------------------------------------
 
     async def handle(self, cmd: str, cwd: str, send: SendFn | None = None) -> None:
-        """Run the pipeline if `cmd` is a trigger; no-op otherwise."""
+        """Run the pipeline if `cmd` is a trigger; no-op otherwise.
+
+        Decoration (the header/footer) is a presentation concern: when streaming
+        over a socket (`send` given), the `ask` client renders its own header so
+        only the raw answer text goes over the wire. The foreground/dev path
+        (`send is None`) has no client, so a plaintext header is emitted here.
+        """
         if not self.is_trigger(cmd):
             return
+        decorate = send is None
         emit = send or _stdout_send
-        inline_context = self.extract_inline_context(cmd)
+        raw_inline = self.extract_inline_context(cmd)
+        intent, inline_context = self._split_intent(raw_inline)
         async with self._lock:
             loop = asyncio.get_running_loop()
             # is_available() may block on a short HTTP probe — keep it off the loop.
@@ -95,13 +109,79 @@ class TriggerHandler:
                     " Check that it is running/configured (see config.toml).\n"
                 )
                 return
-            prompt = self._assembler.assemble(cwd, inline_context)
-            await emit(HEADER)
+            prior = self._recent_exchange()
+            prompt = self._assembler.assemble(
+                cwd, inline_context, intent=intent, prior_exchange=prior
+            )
+            if decorate:
+                await emit(HEADER)
+            collected: list[str] = []
+
+            async def collecting_emit(text: str) -> None:
+                collected.append(text)
+                await emit(text)
+
             try:
-                await self._stream_to(self._backend.stream_query(prompt), emit)
-                await emit("\n")
+                await self._stream_to(
+                    self._backend.stream_query(prompt), collecting_emit
+                )
+                if decorate:
+                    await emit("\n")
+                self._record_exchange(raw_inline or "??", "".join(collected))
             except LLMError as exc:
                 await emit(f"\nTerminalGhost error: {exc}\n")
+
+    async def hint(self, cwd: str, send: SendFn) -> None:
+        """Best-effort one-line proactive hint for a recent failure in `cwd`.
+
+        Stays completely silent (emits nothing) when there's no recent error
+        here or the backend is down — it runs in the user's prompt, so it must
+        never error or block noticeably.
+        """
+        if self._db is None or self._db.get_last_error(cwd=cwd) is None:
+            return
+        loop = asyncio.get_running_loop()
+        available = await loop.run_in_executor(None, self._backend.is_available)
+        if not available:
+            return
+        prompt = self._assembler.assemble(cwd, intent="hint")
+        async with self._lock:
+            try:
+                await self._stream_to(self._backend.stream_query(prompt), send)
+            except LLMError:
+                pass  # hints are best-effort; never disrupt the prompt
+
+    # -- conversational follow-ups ---------------------------------------------
+
+    def _split_intent(self, text: str) -> tuple[str, str]:
+        """Pull a leading `fix`/`explain` keyword off the inline context."""
+        if not text:
+            return "default", ""
+        first, _, rest = text.partition(" ")
+        if first.lower() in self._INTENTS:
+            return first.lower(), rest.strip()
+        return "default", text
+
+    def _recent_exchange(self) -> tuple[str, str] | None:
+        if self._last_exchange is None:
+            return None
+        window = self._config.llm.followup_seconds
+        if window <= 0:
+            return None
+        ts, question, answer = self._last_exchange
+        if time.monotonic() - ts > window:
+            return None
+        return question, answer
+
+    def _record_exchange(self, question: str, answer: str) -> None:
+        answer = answer.strip()
+        if not answer:
+            return
+        self._last_exchange = (
+            time.monotonic(),
+            question,
+            answer[: self._MAX_STORED_ANSWER],
+        )
 
     async def _stream_to(self, stream: AsyncIterator[str], emit: SendFn) -> None:
         """Consume the LLM stream, leaving the output clean on interrupt."""

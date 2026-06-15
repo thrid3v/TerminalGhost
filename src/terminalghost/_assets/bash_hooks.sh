@@ -24,13 +24,31 @@
 export TG_HOST="${TG_HOST:-127.0.0.1}"
 export TG_PORT="${TG_PORT:-48632}"
 
-# Send one command event. Args: cmd exit_code cwd duration_ms
+# --- Optional output capture (EXPERIMENTAL, opt-in) -------------------------
+# When TG_CAPTURE_OUTPUT=1, re-exec this interactive shell inside `script` so
+# command output is logged to a per-session transcript the precmd hook can
+# tail. `script` keeps a real PTY, so the terminal behaves normally. Off by
+# default (and POSIX-only — Windows needs ConPTY, not yet supported).
+if [[ "$TG_CAPTURE_OUTPUT" == "1" && -z "$_TG_IN_SCRIPT" && $- == *i* ]] \
+   && command -v script >/dev/null 2>&1; then
+  export _TG_IN_SCRIPT=1
+  export _TG_LOG="${TMPDIR:-/tmp}/tg-capture.$$.log"
+  : > "$_TG_LOG" 2>/dev/null
+  if script --version 2>/dev/null | grep -qi util-linux; then
+    exec script -qf -c "exec $SHELL" "$_TG_LOG"   # util-linux
+  else
+    exec script -q "$_TG_LOG" "$SHELL"            # BSD / macOS
+  fi
+fi
+
+# Send one command event. Args: cmd exit_code cwd duration_ms [output]
 _tg_send_event() {
-  python3 - "$1" "$2" "$3" "$4" <<'PY' >/dev/null 2>&1 &
+  python3 - "$1" "$2" "$3" "$4" "${5:-}" <<'PY' >/dev/null 2>&1 &
 import json, os, socket, sys, time
 
 cmd, exit_code, cwd, duration = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
-payload = json.dumps({
+output = sys.argv[5] if len(sys.argv) > 5 else ""
+payload = {
     "cmd": cmd,
     "exit": max(0, min(255, exit_code)),
     "cwd": cwd,
@@ -38,17 +56,27 @@ payload = json.dumps({
     "ts": time.time(),
     "pid": os.getppid(),
     "shell": "bash",
-}) + "\n"
+}
+if output:
+    payload["output"] = output
+line = json.dumps(payload) + "\n"
 try:
     with socket.create_connection(
         (os.environ.get("TG_HOST", "127.0.0.1"), int(os.environ.get("TG_PORT", "48632"))),
         timeout=0.5,
     ) as sock:
-        sock.sendall(payload.encode("utf-8"))
+        sock.sendall(line.encode("utf-8"))
 except OSError:
     pass  # daemon not running — stay silent
 PY
   disown 2>/dev/null
+}
+
+# Read the transcript written since the last command (stripped of ANSI), or "".
+_tg_capture_output() {
+  [[ -n "$_TG_LOG" && -f "$_TG_LOG" ]] || { echo ""; return; }
+  tail -c "+$(( ${_TG_LOG_OFF:-0} + 1 ))" "$_TG_LOG" 2>/dev/null \
+    | sed -E 's/\x1b\[[0-9;?]*[A-Za-z]//g' | tail -n 40 | tail -c 4000
 }
 
 _tg_now_ms() {
@@ -69,6 +97,8 @@ _tg_preexec() {
   _TG_CMD="$BASH_COMMAND"
   _TG_START="$(_tg_now_ms)"
   _TG_PREEXEC_DONE=1
+  # Mark where this command's output will start in the transcript.
+  [[ -n "$_TG_LOG" && -f "$_TG_LOG" ]] && _TG_LOG_OFF=$(wc -c < "$_TG_LOG" 2>/dev/null)
 }
 
 _tg_precmd() {
@@ -76,8 +106,15 @@ _tg_precmd() {
   _TG_PREEXEC_DONE=0
   [[ -z "$_TG_CMD" ]] && return
   local duration=$(( $(_tg_now_ms) - ${_TG_START:-$(_tg_now_ms)} ))
-  _tg_send_event "$_TG_CMD" "$exit_code" "$PWD" "$duration"
+  local output=""
+  [[ -n "$_TG_LOG" ]] && output="$(_tg_capture_output)"
+  _tg_send_event "$_TG_CMD" "$exit_code" "$PWD" "$duration" "$output"
   unset _TG_CMD _TG_START
+  # Opt-in proactive hint after a failure (TG_HINTS=1). Blocks briefly.
+  if [[ "$TG_HINTS" == "1" && "$exit_code" != 0 ]]; then
+    terminalghost hint 2>/dev/null
+  fi
+  return $exit_code  # don't clobber $? for the user's prompt
 }
 
 trap '_tg_preexec' DEBUG

@@ -35,9 +35,11 @@ class FakeBackend(LLMBackend):
 class FakeAssembler:
     def __init__(self):
         self.calls: list[tuple[str, str]] = []
+        self.last_kwargs: dict = {}
 
-    def assemble(self, cwd, inline_context=""):
+    def assemble(self, cwd, inline_context="", *, intent="default", prior_exchange=None):
         self.calls.append((cwd, inline_context))
+        self.last_kwargs = {"intent": intent, "prior_exchange": prior_exchange}
         return f"PROMPT[{cwd}|{inline_context}]"
 
 
@@ -137,8 +139,19 @@ async def test_full_pipeline(handler):
     text = "".join(out)
     assert assembler.calls == [("/proj", "why did make fail")]
     assert backend.stream_calls == 1
-    assert "TerminalGhost" in text
+    # Over a socket (send given) only raw answer text is streamed — the client
+    # renders its own header.
     assert "hello world" in text
+    assert "TerminalGhost" not in text
+
+
+async def test_foreground_path_emits_plaintext_header(handler, capsys):
+    h, _, _ = handler
+    # send=None → foreground/dev path writes a plaintext header to stdout.
+    await h.handle("??", "/tmp")
+    out = capsys.readouterr().out
+    assert "TerminalGhost" in out
+    assert "hello world" in out
 
 
 async def test_llm_error_is_reported_not_raised(handler):
@@ -168,6 +181,80 @@ async def test_cancel_mid_stream_is_clean(handler):
     except asyncio.CancelledError:
         pass
     assert "[interrupted]" in "".join(out)
+
+
+async def test_intent_fix_is_parsed(handler):
+    h, _, assembler = handler
+    _, send = collect_sink()
+    await h.handle("?? fix the makefile", "/proj", send=send)
+    assert assembler.calls[-1] == ("/proj", "the makefile")
+    assert assembler.last_kwargs["intent"] == "fix"
+
+
+async def test_default_intent_when_no_keyword(handler):
+    h, _, assembler = handler
+    _, send = collect_sink()
+    await h.handle("?? why did it fail", "/proj", send=send)
+    assert assembler.last_kwargs["intent"] == "default"
+    assert assembler.calls[-1] == ("/proj", "why did it fail")
+
+
+async def test_followup_exchange_is_passed_next_time(handler):
+    h, backend, assembler = handler
+    backend.chunks = ("the answer",)
+    _, send = collect_sink()
+    await h.handle("?? first question", "/proj", send=send)
+    # First call has no prior exchange.
+    assert h._recent_exchange() == ("first question", "the answer")
+    await h.handle("?? follow up", "/proj", send=send)
+    prior = assembler.last_kwargs["prior_exchange"]
+    assert prior == ("first question", "the answer")
+
+
+async def test_followup_disabled_when_window_zero():
+    import dataclasses
+
+    config = Config()
+    config = dataclasses.replace(
+        config, llm=dataclasses.replace(config.llm, followup_seconds=0)
+    )
+    h = TriggerHandler(None, FakeAssembler(), FakeBackend(chunks=("a",)), config)
+    _, send = collect_sink()
+    await h.handle("??", "/proj", send=send)
+    assert h._recent_exchange() is None  # window 0 disables follow-ups
+
+
+class FakeDB:
+    def __init__(self, last_error):
+        self._last_error = last_error
+
+    def get_last_error(self, cwd=None):
+        return self._last_error
+
+
+async def test_hint_silent_without_recent_error():
+    h = TriggerHandler(FakeDB(None), FakeAssembler(), FakeBackend(), Config())
+    out, send = collect_sink()
+    await h.hint("/proj", send)
+    assert out == []
+
+
+async def test_hint_streams_when_error_present():
+    h = TriggerHandler(
+        FakeDB("err"), FakeAssembler(), FakeBackend(chunks=("try --force",)), Config()
+    )
+    out, send = collect_sink()
+    await h.hint("/proj", send)
+    assert "try --force" in "".join(out)
+
+
+async def test_hint_silent_when_backend_down():
+    h = TriggerHandler(
+        FakeDB("err"), FakeAssembler(), FakeBackend(available=False), Config()
+    )
+    out, send = collect_sink()
+    await h.hint("/proj", send)
+    assert out == []
 
 
 async def test_rapid_triggers_serialized(handler):

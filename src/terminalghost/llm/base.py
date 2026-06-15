@@ -85,5 +85,11 @@ def get_backend(config: "Config") -> LLMBackend:
         from terminalghost.llm.backends.cloud import CloudBackend
 
         openai = config.llm.openai
-        return CloudBackend(provider="openai", api_key=openai.api_key, model=openai.model)
+        return CloudBackend(
+            provider="openai",
+            api_key=openai.api_key,
+            model=openai.model,
+            max_tokens=openai.max_tokens,
+            base_url=openai.base_url,
+        )
     raise ValueError(f"unknown LLM backend: {backend!r}")

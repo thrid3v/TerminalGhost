@@ -1,0 +1,81 @@
+# TerminalGhost — example configuration
+# Copy to ~/.config/terminalghost/config.toml and edit as needed
+# (or just run `terminalghost init`). All values shown are the built-in defaults.
+
+[general]
+# Maximum number of commands kept in the rolling buffer
+history_size = 200
+# Path to the SQLite database (~ expands to home dir)
+db_path = "~/.local/share/terminalghost/history.db"
+# TCP loopback address the daemon listens on (shell hooks write here).
+# TCP is used instead of a Unix socket so the daemon also runs on Windows.
+host = "127.0.0.1"
+# Port to bind. Use 0 to pick a free port automatically; the daemon writes the
+# chosen port to a runtime file that `terminalghost ask` reads.
+port = 48632
+# PID file location
+pid_file = "~/.local/share/terminalghost/terminalghost.pid"
+
+[ui]
+# Color policy: "auto" (color only on a TTY), "always", or "never".
+color = "auto"
+# Show the brand banner on `init` / `start`.
+banner = true
+# Render streamed ?? answers as live markdown (vs. plain streamed text).
+markdown = true
+
+[capture]
+# Redact secrets in stored command text (TOKEN=..., --password=..., creds in
+# URLs) and in any captured output.
+redact_passwords = true
+# Commands whose output is never stored (regex list)
+blocked_commands = ["gpg", "pass", "secret-tool"]
+# Maximum bytes of output stored per command
+max_output_bytes = 4096
+# Store command output the hooks send. Opt-in (also needs TG_CAPTURE_OUTPUT=1
+# in the POSIX hooks). Acts as a privacy gate: when false, output is dropped.
+capture_output = false
+# Keep only the last N lines of captured output (errors are usually at the end)
+output_max_lines = 40
+# Use the PTY wrapper (true) instead of relying solely on shell hooks (false)
+use_pty = false
+
+[context]
+# Max directory tree depth when assembling prompt context
+tree_depth = 3
+# Directories to skip in the tree walk
+tree_ignore = [".git", "__pycache__", "node_modules", ".venv"]
+# Approximate token budget for the assembled context sent to the LLM
+token_budget = 3000
+
+[llm]
+# Which backend to use: "ollama" | "claude" | "openai"
+backend = "ollama"
+# Pass extra text along with ?? to the LLM (e.g. "?? why did this fail").
+# Also enables `?? fix ...` and `?? explain ...` intents.
+allow_inline_context = true
+# Seconds a previous ?? answer stays in context for follow-up questions
+# (0 disables conversational follow-ups).
+followup_seconds = 300
+
+[llm.ollama]
+base_url = "http://localhost:11434"
+model = "llama3"
+timeout_seconds = 60
+# Number of retry attempts on connection error
+retries = 2
+
+[llm.claude]
+# API key — prefer setting ANTHROPIC_API_KEY env var instead.
+# Requires the cloud extra: pipx install "terminalghost[cloud]"
+api_key = ""
+model = "claude-opus-4-8"
+max_tokens = 1024
+
+[llm.openai]
+# Works with OpenAI and any OpenAI-compatible server (Groq, LM Studio,
+# llama.cpp, Ollama's /v1) — just point base_url at it. Prefer OPENAI_API_KEY.
+api_key = ""
+model = "gpt-4o-mini"
+base_url = "https://api.openai.com/v1"
+max_tokens = 1024

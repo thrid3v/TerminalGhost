@@ -152,14 +152,22 @@ class Database:
             ).fetchall()
         return [_row_to_event(row) for row in rows]
 
-    def get_last_error(self) -> CommandEvent | None:
-        """Return the most recent command with exit_code != 0, or None."""
+    def get_last_error(self, cwd: str | None = None) -> CommandEvent | None:
+        """Return the most recent failing command, or None.
+
+        When `cwd` is given, only failures in that directory are considered —
+        this scopes a `??` to the project you're standing in and avoids
+        surfacing an unrelated error from another terminal.
+        """
         conn = self._require_conn()
+        query = f"SELECT {_COLUMNS} FROM commands WHERE exit_code != 0"
+        params: tuple = ()
+        if cwd is not None:
+            query += " AND cwd = ?"
+            params = (cwd,)
+        query += " ORDER BY id DESC LIMIT 1"
         with self._lock:
-            row = conn.execute(
-                f"SELECT {_COLUMNS} FROM commands"
-                " WHERE exit_code != 0 ORDER BY id DESC LIMIT 1"
-            ).fetchone()
+            row = conn.execute(query, params).fetchone()
         return _row_to_event(row) if row else None
 
     # -- sessions ------------------------------------------------------------

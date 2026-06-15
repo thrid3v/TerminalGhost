@@ -35,6 +35,8 @@ _READ_LIMIT = 256 * 1024  # max bytes per JSON line
 OnEvent = Callable[[CommandEvent, int | None, str | None], Awaitable[None]]
 # on_query(cmd, cwd, send) — run the ?? pipeline, writing chunks via send
 OnQuery = Callable[[str, str, Callable[[str], Awaitable[None]]], Awaitable[None]]
+# on_hint(cwd, send) — stream a one-line proactive hint (or nothing)
+OnHint = Callable[[str, Callable[[str], Awaitable[None]]], Awaitable[None]]
 
 
 class HookReceiver:
@@ -46,11 +48,13 @@ class HookReceiver:
         port: int,
         on_event: OnEvent,
         on_query: OnQuery | None = None,
+        on_hint: OnHint | None = None,
     ) -> None:
         self._host = host
         self._port = port
         self._on_event = on_event
         self._on_query = on_query
+        self._on_hint = on_hint
         self._server: asyncio.Server | None = None
 
     @property
@@ -113,6 +117,9 @@ class HookReceiver:
                 if obj.get("type") == "query":
                     await self._handle_query(obj, writer)
                     break  # one query per connection; close after responding
+                if obj.get("type") == "hint":
+                    await self._handle_hint(obj, writer)
+                    break
                 try:
                     event, shell_pid, shell = self._parse_payload(text)
                 except ValueError as exc:
@@ -146,6 +153,21 @@ class HookReceiver:
             await self._on_query(cmd[:MAX_CMD_CHARS], cwd, send)
         except ConnectionError:
             log.info("query client disconnected mid-response")
+
+    async def _handle_hint(self, obj: dict, writer: asyncio.StreamWriter) -> None:
+        """Stream a one-line proactive hint back to the client (or nothing)."""
+        cwd = obj.get("cwd")
+        if not isinstance(cwd, str) or not cwd or self._on_hint is None:
+            return
+
+        async def send(text: str) -> None:
+            writer.write(text.encode("utf-8", errors="replace"))
+            await writer.drain()
+
+        try:
+            await self._on_hint(cwd, send)
+        except ConnectionError:
+            log.info("hint client disconnected mid-response")
 
     # -- payload parsing -----------------------------------------------------------
 

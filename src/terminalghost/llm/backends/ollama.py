@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import AsyncIterator, Awaitable, Callable
 
 import httpx
@@ -43,6 +44,9 @@ class OllamaBackend(LLMBackend):
         self._retries = max(0, retries)
         # Injectable transport so tests can use httpx.MockTransport.
         self._transport = transport
+        # Short cache for is_available() so rapid ?? don't each pay an HTTP probe.
+        self._avail_cache: tuple[float, bool] | None = None
+        self._avail_ttl = 5.0
 
     # -- public API ----------------------------------------------------------
 
@@ -113,18 +117,28 @@ class OllamaBackend(LLMBackend):
                 await asyncio.sleep(0.5 * 2 ** (attempt - 1))
 
     def is_available(self) -> bool:
-        """Fast sync probe: server up AND the configured model is pulled."""
+        """Fast sync probe: server up AND the configured model is pulled.
+
+        Result is cached for a few seconds so back-to-back ?? don't each pay
+        the HTTP round-trip.
+        """
+        now = time.monotonic()
+        if self._avail_cache is not None and now - self._avail_cache[0] < self._avail_ttl:
+            return self._avail_cache[1]
         try:
             response = httpx.get(f"{self._base_url}/api/tags", timeout=1.0)
             if response.status_code != 200:
-                return False
-            names = [m.get("name", "") for m in response.json().get("models", [])]
+                result = False
+            else:
+                names = [m.get("name", "") for m in response.json().get("models", [])]
+                result = any(
+                    name == self._model or name.split(":", 1)[0] == self._model
+                    for name in names
+                )
         except Exception:  # noqa: BLE001 — any failure means "not available"
-            return False
-        return any(
-            name == self._model or name.split(":", 1)[0] == self._model
-            for name in names
-        )
+            result = False
+        self._avail_cache = (now, result)
+        return result
 
     # -- internals -----------------------------------------------------------
 
