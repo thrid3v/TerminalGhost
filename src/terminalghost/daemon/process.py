@@ -48,6 +48,8 @@ ASK_IDLE_TIMEOUT = 300.0
 HINT_TIMEOUT = 12.0
 # Rotate the daemon log once it grows past this many bytes.
 LOG_MAX_BYTES = 5 * 1024 * 1024
+# Cap on captured output the `exec` wrapper keeps (tail); the daemon trims more.
+EXEC_CAPTURE_BYTES = 64 * 1024
 
 
 class Daemon:
@@ -82,6 +84,7 @@ class Daemon:
                 on_event=self._on_event,
                 on_query=self._on_query,
                 on_hint=self._on_hint,
+                on_suggestion=self._on_suggestion,
             )
             await receiver.start()
             # Record the actually-bound port so clients can find us even when
@@ -116,9 +119,13 @@ class Daemon:
         assert self._db is not None
         event.session_id = self._session_for(shell_pid, shell)
         cap = self._config.capture
-        # Output: privacy gate first (drop entirely unless explicitly enabled and
-        # the command isn't blocked), then trim + redact what remains.
-        if not cap.capture_output or self._is_blocked(event.cmd):
+        # Output: privacy gate first. Ambient hook output needs capture_output;
+        # explicit `terminalghost exec` (source="run") is always kept. Blocked
+        # commands never store output regardless.
+        keep_output = (cap.capture_output or event.source == "run") and not self._is_blocked(
+            event.cmd
+        )
+        if not keep_output:
             event.output = None
         elif event.output:
             event.output = _trim_output(event.output, cap.output_max_lines)
@@ -148,6 +155,13 @@ class Daemon:
         """Stream a one-line proactive hint (best-effort; records nothing)."""
         assert self._trigger is not None
         await self._trigger.hint(cwd, send)
+
+    async def _on_suggestion(self, send) -> None:
+        """Write back the last command TerminalGhost suggested (for `apply`)."""
+        assert self._trigger is not None
+        command = self._trigger.last_suggestion()
+        if command:
+            await send(command)
 
     def _session_for(self, shell_pid: int | None, shell: str | None) -> int:
         assert self._db is not None
@@ -350,6 +364,15 @@ def main() -> None:
     ask.add_argument("text", nargs="*", help="optional extra context after ??")
     ask.add_argument("-c", "--copy", action="store_true",
                      help="copy the answer to the clipboard")
+    exec_p = sub.add_parser(
+        "exec", help="run a command and capture its output for ?? (alias: tgr)"
+    )
+    exec_p.add_argument("cmd", nargs=argparse.REMAINDER, help="the command to run")
+    apply_p = sub.add_parser(
+        "apply", help="run the command TerminalGhost last suggested (alias: tga)"
+    )
+    apply_p.add_argument("-y", "--yes", action="store_true",
+                         help="run without confirmation")
 
     sub.add_parser("hint", help="print a one-line proactive hint for the last failure")
     sub.add_parser("init", help="interactive first-time setup wizard")
@@ -391,6 +414,10 @@ def main() -> None:
         sys.exit(_cmd_ask(config, " ".join(args.text), copy=args.copy))
     elif command == "hint":
         sys.exit(_cmd_hint(config))
+    elif command == "exec":
+        sys.exit(_cmd_exec(config, args.cmd))
+    elif command == "apply":
+        sys.exit(_cmd_apply(config, assume_yes=args.yes))
     elif command == "init":
         from terminalghost.cli.init import cmd_init
 
@@ -636,6 +663,130 @@ def _cmd_ask(config: Config, text: str, copy: bool = False) -> int:
         _print_unreachable(config)
         return 1
     return 0
+
+
+def _write_raw(data: bytes) -> None:
+    """Write bytes to stdout, tolerating streams without a binary buffer."""
+    buf = getattr(sys.stdout, "buffer", None)
+    if buf is not None:
+        buf.write(data)
+        buf.flush()
+    else:
+        sys.stdout.write(data.decode("utf-8", errors="replace"))
+        sys.stdout.flush()
+
+
+def _cmd_exec(config: Config, argv: list[str]) -> int:
+    """Run a command, mirror its output live, and ship the captured output to
+    the daemon so a following ?? sees the real error text. Cross-platform."""
+    import subprocess
+
+    if not argv:
+        print("usage: terminalghost exec <command> [args...]", file=sys.stderr)
+        return 2
+    cmdline = " ".join(argv)
+    start = time.monotonic()
+    try:
+        proc = subprocess.Popen(
+            cmdline, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+        )
+    except OSError as exc:
+        print(f"terminalghost exec: cannot run command: {exc}", file=sys.stderr)
+        return 1
+
+    captured = bytearray()
+    fd = proc.stdout.fileno()  # type: ignore[union-attr]
+    try:
+        while True:
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                break
+            _write_raw(chunk)
+            captured += chunk
+            if len(captured) > EXEC_CAPTURE_BYTES:
+                del captured[:-EXEC_CAPTURE_BYTES]
+    except KeyboardInterrupt:
+        proc.terminate()
+    rc = proc.wait()
+    duration = int((time.monotonic() - start) * 1000)
+    text = captured.decode("utf-8", errors="replace")
+    _send_run_event(config, cmdline, rc, duration, text)
+    return rc
+
+
+def _fetch_suggestion(config: Config) -> str:
+    """Ask the daemon for the last suggested command (empty string if none)."""
+    data = b""
+    try:
+        with socket.create_connection(
+            (config.general.host, _effective_port(config)), timeout=3
+        ) as sock:
+            sock.sendall((json.dumps({"type": "suggestion"}) + "\n").encode("utf-8"))
+            sock.settimeout(5)
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+    except OSError:
+        return ""
+    return data.decode("utf-8", errors="replace").strip()
+
+
+def _cmd_apply(config: Config, assume_yes: bool = False) -> int:
+    """Run the command TerminalGhost last suggested, after confirmation."""
+    from rich.markup import escape
+
+    from terminalghost.ui import get_console
+
+    console = get_console(color=config.ui.color)
+    command = _fetch_suggestion(config)
+    if not command:
+        console.print(
+            "[tg.muted]Nothing to apply yet — ask a [tg.key]??[/] first "
+            "(works best with [tg.key]?? fix[/]).[/]"
+        )
+        return 0
+
+    console.print(f"[tg.header]Suggested:[/] [tg.cmd]{escape(command)}[/]")
+    if not assume_yes:
+        if not sys.stdin.isatty():
+            console.print(
+                "[tg.warn]Refusing to run without confirmation.[/] "
+                "Re-run with [tg.key]--yes[/]."
+            )
+            return 1
+        try:
+            answer = input("Run it? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 130
+        if answer not in ("y", "yes"):
+            console.print("[tg.muted]Skipped.[/]")
+            return 0
+    return _cmd_exec(config, [command])
+
+
+def _send_run_event(config: Config, cmd: str, exit_code: int, duration_ms: int,
+                    output: str) -> None:
+    """Fire-and-forget a run-sourced command event (best-effort)."""
+    payload = json.dumps({
+        "cmd": cmd,
+        "exit": exit_code & 0xFF,
+        "cwd": os.getcwd(),
+        "duration": max(0, duration_ms),
+        "ts": time.time(),
+        "shell": "exec",
+        "source": "run",
+        "output": output,
+    }) + "\n"
+    try:
+        with socket.create_connection(
+            (config.general.host, _effective_port(config)), timeout=1
+        ) as sock:
+            sock.sendall(payload.encode("utf-8"))
+    except OSError:
+        pass  # daemon not running — capture is best-effort, never block the user
 
 
 def _cmd_hint(config: Config) -> int:
