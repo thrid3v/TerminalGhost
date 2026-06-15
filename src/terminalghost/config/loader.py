@@ -24,6 +24,7 @@ DEFAULT_CONFIG_PATH = os.path.join("~", ".config", "terminalghost", "config.toml
 
 VALID_BACKENDS = ("ollama", "claude", "openai")
 VALID_COLOR_MODES = ("auto", "always", "never")
+VALID_THEMES = ("dark", "light", "high-contrast")
 
 
 class ConfigError(Exception):
@@ -105,6 +106,8 @@ class GeneralConfig:
 class UIConfig:
     # Color policy for terminal output: "auto" (color iff TTY), "always", "never".
     color: str = "auto"
+    # Palette: "dark" | "light" | "high-contrast".
+    theme: str = "dark"
     # Show the brand banner on init/start.
     banner: bool = True
     # Render streamed ?? answers as live markdown (vs. plain streamed text).
@@ -276,6 +279,10 @@ def _validate(raw: dict) -> None:
         raise ConfigError(
             f"ui.color must be one of {VALID_COLOR_MODES}, got {color!r}"
         )
+
+    theme = _get(raw, "ui", "theme")
+    if theme is not None and theme not in VALID_THEMES:
+        raise ConfigError(f"ui.theme must be one of {VALID_THEMES}, got {theme!r}")
 
 
 def _make(cls, section) -> object:

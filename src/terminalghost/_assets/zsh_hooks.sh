@@ -61,6 +61,11 @@ payload = {
 }
 if output:
     payload["output"] = output
+try:
+    with open(os.path.expanduser("~/.local/share/terminalghost/token")) as _tf:
+        payload["token"] = _tf.read().strip()
+except OSError:
+    pass
 line = json.dumps(payload) + "\n"
 try:
     with socket.create_connection(
@@ -115,3 +120,5 @@ add-zsh-hook precmd _tg_precmd
 # tga — run the command TerminalGhost last suggested (asks first).
 tgr() { terminalghost exec "$@" }
 tga() { terminalghost apply "$@" }
+# tg: ask normally, but explain piped input (e.g. `make 2>&1 | tg`).
+tg() { if [[ -t 0 ]]; then terminalghost ask "$@"; else terminalghost explain; fi }

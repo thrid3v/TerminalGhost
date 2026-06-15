@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import time
 
+from terminalghost.cli import client
 from terminalghost.config.loader import Config
-from terminalghost.daemon import process
 from terminalghost.daemon.process import Daemon
 from terminalghost.storage.db import CommandEvent, Database
 from terminalghost.trigger.handler import TriggerHandler
@@ -22,6 +22,11 @@ def test_extract_command_from_fenced_block():
 def test_extract_command_skips_comment_lines():
     answer = "```\n# create the branch\ngit branch foo\n```"
     assert TriggerHandler._extract_command(answer) == "git branch foo"
+
+
+def test_extract_command_dollar_prompt_line():
+    answer = "Try:\n\n$ git checkout main\n\nThat switches branches."
+    assert TriggerHandler._extract_command(answer) == "git checkout main"
 
 
 def test_extract_command_inline_fallback():
@@ -93,8 +98,15 @@ def test_cmd_exec_captures_output_and_exit(monkeypatch):
     def fake_send(config, cmd, rc, dur, output):
         sent.update(cmd=cmd, rc=rc, output=output)
 
-    monkeypatch.setattr(process, "_send_run_event", fake_send)
-    rc = process._cmd_exec(Config(), ["echo", "hello-capture"])
+    monkeypatch.setattr(client, "_send_run_event", fake_send)
+    rc = client._cmd_exec(Config(), "echo hello-capture")
     assert rc == 0
     assert "hello-capture" in sent["output"]
     assert sent["cmd"] == "echo hello-capture"
+
+
+def test_build_cmdline_preserves_quoted_args():
+    line = client._build_cmdline(["pytest", "-k", "foo bar"])
+    # the arg with a space stays one quoted token, not split into foo / bar
+    assert "foo bar" in line
+    assert line.startswith("pytest -k ")

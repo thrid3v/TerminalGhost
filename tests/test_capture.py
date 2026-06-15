@@ -37,7 +37,7 @@ class Collector:
         self.events.append((event, shell_pid, shell))
         self.got_event.set()
 
-    async def on_query(self, cmd, cwd, send):
+    async def on_query(self, cmd, cwd, send, context=None):
         self.queries.append((cmd, cwd))
         await send("ANSWER for ")
         await send(cmd)
@@ -54,6 +54,45 @@ async def receiver():
 
 async def connect(recv: HookReceiver):
     return await asyncio.open_connection("127.0.0.1", recv.port)
+
+
+# -- auth token ------------------------------------------------------------------
+
+
+def test_token_ok():
+    async def noop(*args):
+        pass
+
+    recv = HookReceiver("127.0.0.1", 0, noop, auth_token="abc")
+    assert recv._token_ok("abc") is True
+    assert recv._token_ok("xyz") is False
+    assert recv._token_ok(None) is False
+    # auth disabled (no token configured) accepts anything
+    assert HookReceiver("127.0.0.1", 0, noop)._token_ok(None) is True
+
+
+async def test_auth_token_enforced():
+    collector = Collector()
+    recv = HookReceiver("127.0.0.1", 0, collector.on_event, auth_token="s3cret")
+    await recv.start()
+    try:
+        # Missing token → rejected, no event recorded.
+        _, writer = await asyncio.open_connection("127.0.0.1", recv.port)
+        writer.write((json.dumps(valid_payload()) + "\n").encode())
+        await writer.drain()
+        writer.close()
+        await asyncio.sleep(0.05)
+        assert collector.events == []
+
+        # Correct token → processed.
+        _, writer = await asyncio.open_connection("127.0.0.1", recv.port)
+        writer.write((json.dumps(valid_payload(token="s3cret")) + "\n").encode())
+        await writer.drain()
+        await asyncio.wait_for(collector.got_event.wait(), timeout=2)
+        assert len(collector.events) == 1
+        writer.close()
+    finally:
+        await recv.stop()
 
 
 # -- _parse_payload -------------------------------------------------------------

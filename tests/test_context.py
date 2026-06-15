@@ -67,6 +67,13 @@ def test_assemble_scopes_error_to_cwd(db, project):
     assert "FAILING" not in prompt
 
 
+def test_assemble_includes_pasted_output(db, project):
+    assembler = ContextAssembler(db, Config())
+    prompt = assembler.assemble(str(project), pasted="ERROR: boom at line 5")
+    assert "Output to explain" in prompt
+    assert "boom at line 5" in prompt
+
+
 def test_assemble_without_error_or_note(db, project):
     db.insert_command(make_event("ls"))
     assembler = ContextAssembler(db, Config())

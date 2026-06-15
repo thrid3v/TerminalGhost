@@ -37,9 +37,11 @@ class FakeAssembler:
         self.calls: list[tuple[str, str]] = []
         self.last_kwargs: dict = {}
 
-    def assemble(self, cwd, inline_context="", *, intent="default", prior_exchange=None):
+    def assemble(self, cwd, inline_context="", *, intent="default", prior_exchange=None,
+                 pasted=None):
         self.calls.append((cwd, inline_context))
-        self.last_kwargs = {"intent": intent, "prior_exchange": prior_exchange}
+        self.last_kwargs = {"intent": intent, "prior_exchange": prior_exchange,
+                            "pasted": pasted}
         return f"PROMPT[{cwd}|{inline_context}]"
 
 
@@ -225,11 +227,36 @@ async def test_followup_disabled_when_window_zero():
 
 
 class FakeDB:
-    def __init__(self, last_error):
+    def __init__(self, last_error, recent=None):
         self._last_error = last_error
+        self._recent = recent or []
 
     def get_last_error(self, cwd=None):
         return self._last_error
+
+    def get_recent_commands(self, limit=10):
+        return self._recent
+
+
+async def test_empty_context_emits_tip_not_llm():
+    backend = FakeBackend()
+    h = TriggerHandler(FakeDB(None, recent=[]), FakeAssembler(), backend, Config())
+    out, send = collect_sink()
+    await h.handle("??", "/proj", send=send)
+    assert "Nothing to fix" in "".join(out)
+    assert backend.stream_calls == 0  # tip instead of an LLM call
+
+
+async def test_non_empty_context_skips_tip():
+    import types
+
+    recent = [types.SimpleNamespace(cmd="make build")]
+    backend = FakeBackend()
+    h = TriggerHandler(FakeDB(None, recent=recent), FakeAssembler(), backend, Config())
+    out, send = collect_sink()
+    await h.handle("??", "/proj", send=send)
+    assert "Nothing to fix" not in "".join(out)
+    assert backend.stream_calls == 1
 
 
 async def test_hint_silent_without_recent_error():

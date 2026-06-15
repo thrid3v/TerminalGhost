@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from terminalghost.daemon.process import (
+    _assert_safe_host,
+    _is_loopback,
     _redact_command,
     _redact_output,
     _trim_output,
@@ -37,6 +41,40 @@ def test_redact_url_credentials():
 def test_redact_leaves_normal_commands_untouched():
     for cmd in ("git status", "ls -la", "cp -p a b", "make build", "cd ../foo"):
         assert _redact_command(cmd) == cmd
+
+
+def test_redact_bearer_and_token_literals():
+    assert "<redacted>" in _redact_command('curl -H "Authorization: Bearer ghp_abcdEFGH1234567890xyz"')
+    assert "ghp_" not in _redact_command("git remote set-url o https://ghp_abcdEFGH1234567890xyz@x")
+    out = _redact_output("key=value\nAKIAIOSFODNN7EXAMPLE here\nsk-ant-abc123DEF456ghi789")
+    assert "AKIAIOSFODNN7EXAMPLE" not in out
+    assert "sk-ant-abc123DEF456ghi789" not in out
+
+
+# -- loopback enforcement ---------------------------------------------------
+
+
+def test_is_loopback():
+    assert _is_loopback("127.0.0.1") is True
+    assert _is_loopback("::1") is True
+    assert _is_loopback("localhost") is True
+    assert _is_loopback("0.0.0.0") is False
+    assert _is_loopback("192.168.1.10") is False
+
+
+def test_assert_safe_host_allows_loopback():
+    _assert_safe_host("127.0.0.1")  # no raise
+
+
+def test_assert_safe_host_refuses_remote(monkeypatch):
+    monkeypatch.delenv("TG_ALLOW_REMOTE", raising=False)
+    with pytest.raises(RuntimeError):
+        _assert_safe_host("0.0.0.0")
+
+
+def test_assert_safe_host_remote_opt_in(monkeypatch):
+    monkeypatch.setenv("TG_ALLOW_REMOTE", "1")
+    _assert_safe_host("0.0.0.0")  # no raise with explicit override
 
 
 # -- output trim + redact ---------------------------------------------------

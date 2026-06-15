@@ -23,6 +23,11 @@ $global:__TG_LastHistoryId = (Get-History -Count 1).Id
 function global:Send-TerminalGhostEvent {
     param([string]$Cmd, [int]$ExitCode, [int]$DurationMs)
     try {
+        $token = ''
+        try {
+            $tokenFile = Join-Path $HOME '.local\share\terminalghost\token'
+            $token = (Get-Content $tokenFile -Raw -ErrorAction Stop).Trim()
+        } catch { }
         $payload = (@{
             cmd      = $Cmd
             exit     = [Math]::Max(0, [Math]::Min(255, $ExitCode))
@@ -31,6 +36,7 @@ function global:Send-TerminalGhostEvent {
             ts       = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0
             pid      = $PID
             shell    = 'powershell'
+            token    = $token
         } | ConvertTo-Json -Compress) + "`n"
 
         $client = New-Object System.Net.Sockets.TcpClient
@@ -70,6 +76,10 @@ function global:qq { terminalghost ask @args }
 # tga — run the command TerminalGhost last suggested (asks first).
 function global:tgr { terminalghost exec @args }
 function global:tga { terminalghost apply @args }
+# tg: ask normally, but explain piped input (e.g. `make 2>&1 | tg`).
+function global:tg {
+  if ([Console]::IsInputRedirected) { $input | terminalghost explain } else { terminalghost ask @args }
+}
 
 # `??` works as a function name in Windows PowerShell 5.1; in PowerShell 7+
 # it collides with the null-coalescing operator, so it is defined only where

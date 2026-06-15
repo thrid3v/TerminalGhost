@@ -130,9 +130,9 @@ def _dir_writable(path: str) -> bool:
 def cmd_doctor(config) -> int:
     from rich.markup import escape
 
-    from terminalghost.ui import get_console
+    from terminalghost.ui import console_for
 
-    console = get_console(color=config.ui.color)
+    console = console_for(config)
     console.print("[tg.header]TerminalGhost doctor[/]\n")
 
     checks = gather_checks(config)

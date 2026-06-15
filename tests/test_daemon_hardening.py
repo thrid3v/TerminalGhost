@@ -56,6 +56,18 @@ class _FakeResp:
         return {"models": [{"name": "llama3:latest"}]}
 
 
+def test_ensure_and_read_token(tmp_path, monkeypatch):
+    from terminalghost import runtime
+
+    tf = tmp_path / "token"
+    monkeypatch.setattr(runtime, "token_path", lambda: str(tf))
+    assert runtime.read_token() == ""
+    token = runtime.ensure_token()
+    assert len(token) >= 16
+    assert runtime.read_token() == token
+    assert runtime.ensure_token() == token  # stable across calls
+
+
 def test_is_available_is_cached(monkeypatch):
     calls = {"n": 0}
 

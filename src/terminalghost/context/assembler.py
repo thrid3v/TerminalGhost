@@ -59,12 +59,14 @@ class ContextAssembler:
         *,
         intent: str = "default",
         prior_exchange: tuple[str, str] | None = None,
+        pasted: str | None = None,
     ) -> str:
         """Build and return the complete prompt string within token_budget.
 
         `intent` ("fix" | "explain" | "default") tunes the preamble.
         `prior_exchange` is the (question, answer) from a recent ?? so the user
-        can ask follow-ups.
+        can ask follow-ups. `pasted` is arbitrary output the user piped in to
+        explain (the `explain` command).
         """
         budget = self._config.context.token_budget
         # Scope the surfaced error to this directory so a ?? doesn't pick up an
@@ -77,6 +79,8 @@ class ContextAssembler:
 
         def build(cmds: list, tree_text: str) -> str:
             parts = [preamble]
+            if pasted:
+                parts.append(f"## Output to explain\n{pasted}")
             if prior_exchange is not None:
                 q, a = prior_exchange
                 parts.append(f"## Earlier in this conversation\nQ: {q}\nA: {a}")

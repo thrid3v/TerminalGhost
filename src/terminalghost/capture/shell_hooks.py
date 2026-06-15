@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 from typing import Awaitable, Callable
@@ -33,12 +34,15 @@ _READ_LIMIT = 256 * 1024  # max bytes per JSON line
 
 # on_event(event, shell_pid, shell) — persist a command event
 OnEvent = Callable[[CommandEvent, int | None, str | None], Awaitable[None]]
-# on_query(cmd, cwd, send) — run the ?? pipeline, writing chunks via send
-OnQuery = Callable[[str, str, Callable[[str], Awaitable[None]]], Awaitable[None]]
+# on_query(cmd, cwd, send, context) — run the ?? pipeline, writing chunks via send.
+# `context` is optional pasted text (the `explain` command) to fold into the prompt.
+OnQuery = Callable[..., Awaitable[None]]
 # on_hint(cwd, send) — stream a one-line proactive hint (or nothing)
 OnHint = Callable[[str, Callable[[str], Awaitable[None]]], Awaitable[None]]
 # on_suggestion(send) — write back the last suggested command (or nothing)
 OnSuggestion = Callable[[Callable[[str], Awaitable[None]]], Awaitable[None]]
+# on_reload(send) — hot-reload config (model hot-switch), then confirm
+OnReload = Callable[[Callable[[str], Awaitable[None]]], Awaitable[None]]
 
 
 class HookReceiver:
@@ -52,6 +56,8 @@ class HookReceiver:
         on_query: OnQuery | None = None,
         on_hint: OnHint | None = None,
         on_suggestion: OnSuggestion | None = None,
+        on_reload: OnReload | None = None,
+        auth_token: str = "",
     ) -> None:
         self._host = host
         self._port = port
@@ -59,7 +65,17 @@ class HookReceiver:
         self._on_query = on_query
         self._on_hint = on_hint
         self._on_suggestion = on_suggestion
+        self._on_reload = on_reload
+        # When set, every payload must carry a matching "token"; this stops other
+        # local users on a shared host from reading/posting to the daemon.
+        self._auth_token = auth_token
         self._server: asyncio.Server | None = None
+
+    def _token_ok(self, got) -> bool:
+        """True if auth is disabled (no token) or `got` matches the token."""
+        if not self._auth_token:
+            return True
+        return isinstance(got, str) and hmac.compare_digest(got, self._auth_token)
 
     @property
     def port(self) -> int:
@@ -117,6 +133,9 @@ class HookReceiver:
                 if not isinstance(obj, dict):
                     log.warning("payload is not a JSON object: %.120s", text)
                     continue
+                if not self._token_ok(obj.get("token")):
+                    log.warning("rejecting payload with missing/invalid auth token")
+                    break
 
                 if obj.get("type") == "query":
                     await self._handle_query(obj, writer)
@@ -126,6 +145,9 @@ class HookReceiver:
                     break
                 if obj.get("type") == "suggestion":
                     await self._handle_suggestion(writer)
+                    break
+                if obj.get("type") == "reload":
+                    await self._handle_reload(writer)
                     break
                 try:
                     event, shell_pid, shell = self._parse_payload(text)
@@ -151,13 +173,16 @@ class HookReceiver:
             return
         if self._on_query is None:
             return
+        context = obj.get("context")
+        if context is not None and not isinstance(context, str):
+            context = None
 
         async def send(text: str) -> None:
             writer.write(text.encode("utf-8", errors="replace"))
             await writer.drain()
 
         try:
-            await self._on_query(cmd[:MAX_CMD_CHARS], cwd, send)
+            await self._on_query(cmd[:MAX_CMD_CHARS], cwd, send, context)
         except ConnectionError:
             log.info("query client disconnected mid-response")
 
@@ -189,6 +214,20 @@ class HookReceiver:
             await self._on_suggestion(send)
         except ConnectionError:
             log.info("suggestion client disconnected")
+
+    async def _handle_reload(self, writer: asyncio.StreamWriter) -> None:
+        """Hot-reload config (model switch), then confirm with "ok"."""
+        if self._on_reload is None:
+            return
+
+        async def send(text: str) -> None:
+            writer.write(text.encode("utf-8", errors="replace"))
+            await writer.drain()
+
+        try:
+            await self._on_reload(send)
+        except ConnectionError:
+            log.info("reload client disconnected")
 
     # -- payload parsing -----------------------------------------------------------
 

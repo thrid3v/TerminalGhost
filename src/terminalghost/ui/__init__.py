@@ -7,12 +7,14 @@
 from __future__ import annotations
 
 from terminalghost.ui.banner import render_banner
-from terminalghost.ui.console import get_console, resolve_color
-from terminalghost.ui.theme import GHOST_GLYPH, TG_THEME
+from terminalghost.ui.console import console_for, get_console, resolve_color
+from terminalghost.ui.theme import GHOST_GLYPH, THEME_NAMES, TG_THEME
 
 __all__ = [
     "GHOST_GLYPH",
+    "THEME_NAMES",
     "TG_THEME",
+    "console_for",
     "get_console",
     "render_banner",
     "resolve_color",

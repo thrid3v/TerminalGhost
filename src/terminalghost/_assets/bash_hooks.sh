@@ -59,6 +59,11 @@ payload = {
 }
 if output:
     payload["output"] = output
+try:
+    with open(os.path.expanduser("~/.local/share/terminalghost/token")) as _tf:
+        payload["token"] = _tf.read().strip()
+except OSError:
+    pass
 line = json.dumps(payload) + "\n"
 try:
     with socket.create_connection(
@@ -124,7 +129,8 @@ PROMPT_COMMAND="_tg_precmd${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
 # Note: bash expands ?? as a glob first; if a two-character file exists in
 # the cwd it wins. `tg` is provided as an unambiguous fallback.
 function ?? { terminalghost ask "$@"; }
-function tg { terminalghost ask "$@"; }
+# tg: ask normally, but explain piped input (e.g. `make 2>&1 | tg`).
+function tg { if [ -t 0 ]; then terminalghost ask "$@"; else terminalghost explain; fi; }
 
 # tgr <cmd> — run a command with its output captured for the next ??.
 # tga — run the command TerminalGhost last suggested (asks first).
