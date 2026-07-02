@@ -17,7 +17,10 @@ _ROWS = [
     ("terminalghost dashboard", "full-screen view of captured commands + status"),
     ("terminalghost use <backend>", "switch LLM, e.g. use ollama:mistral or use claude"),
     ("terminalghost theme <name>", "dark | light | high-contrast"),
+    ("terminalghost log --grep <text>", "search history; also --failed, --cwd, --since 2h"),
     ("terminalghost clear [--last N]", "forget captured history (all or the last N)"),
+    ("terminalghost export / import", "carry history between machines as a JSON snapshot"),
+    ("terminalghost redact-check <cmd>", "preview what would be stored (nothing is saved)"),
     ("terminalghost doctor", "diagnose the install and print fixes"),
 ]
 

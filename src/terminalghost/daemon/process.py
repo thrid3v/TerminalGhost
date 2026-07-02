@@ -340,6 +340,37 @@ def _redact_output(output: str) -> str:
     return _redact_secrets("\n".join(redacted))
 
 
+def _cmd_redact_check(config: Config, text: str) -> int:
+    """Dry-run the storage redaction on `text` and show the result.
+
+    Turns the redaction feature into something users can verify ("what would
+    TerminalGhost keep if I typed this?") instead of a black box. Nothing is
+    stored or sent anywhere.
+    """
+    from rich.markup import escape
+
+    from terminalghost.ui import console_for
+
+    console = console_for(config)
+    if not config.capture.redact_passwords:
+        console.print(
+            "[tg.warn]![/] capture.redact_passwords is disabled — commands are "
+            "stored verbatim. Enable it in config.toml to redact secrets."
+        )
+        return 1
+    redacted = _redact_command(text)
+    if redacted == text:
+        console.print("[tg.success]✓[/] No secrets detected; this would be stored as-is:")
+        console.print(f"  [tg.cmd]{escape(text)}[/]")
+    else:
+        highlighted = escape(redacted).replace(
+            "<redacted>", "[tg.warn]<redacted>[/tg.warn]"
+        )
+        console.print("[tg.warn]![/] Secrets detected — this would be stored as:")
+        console.print(f"  [tg.cmd]{highlighted}[/]")
+    return 0
+
+
 # -- CLI ------------------------------------------------------------------------------
 
 
@@ -392,11 +423,33 @@ def main() -> None:
     sub.add_parser("doctor", help="diagnose the installation and print fixes")
     log_p = sub.add_parser("log", help="show recently captured commands")
     log_p.add_argument("-n", "--limit", type=int, default=20, help="how many to show")
+    log_p.add_argument("--failed", action="store_true",
+                       help="only commands that exited non-zero")
+    log_p.add_argument("--cwd", nargs="?", const=".", default=None, metavar="DIR",
+                       help="only commands run in DIR (bare --cwd = here)")
+    log_p.add_argument("--since", default=None, metavar="AGE",
+                       help="only commands newer than AGE (e.g. 90s, 15m, 2h, 3d)")
+    log_p.add_argument("--grep", default=None, metavar="TEXT",
+                       help="only commands containing TEXT (case-insensitive)")
     clear_p = sub.add_parser("clear", help="delete captured command history")
     clear_p.add_argument("--last", type=int, default=None, metavar="N",
                          help="delete only the N most recent commands")
     clear_p.add_argument("-y", "--yes", action="store_true",
                          help="delete without confirmation")
+    export_p = sub.add_parser(
+        "export", help="dump captured history as JSON (stdout or a file)"
+    )
+    export_p.add_argument("-o", "--out", default=None, metavar="FILE",
+                          help="write to FILE instead of stdout")
+    import_p = sub.add_parser(
+        "import", help="load a history snapshot produced by export"
+    )
+    import_p.add_argument("file", help="snapshot file to import")
+    rc_p = sub.add_parser(
+        "redact-check",
+        help="dry-run: show what would be stored for a command (nothing is saved)",
+    )
+    rc_p.add_argument("text", nargs="+", help="the command to test")
     hp = sub.add_parser("hook-path", help="print the path to a bundled shell hook script")
     hp.add_argument("shell", help="shell name (zsh | bash | powershell)")
     uninst = sub.add_parser("uninstall", help="remove the TerminalGhost block from your shell profile")
@@ -466,11 +519,22 @@ def main() -> None:
     elif command == "log":
         from terminalghost.cli.logview import cmd_log
 
-        sys.exit(cmd_log(config, args.limit))
+        sys.exit(cmd_log(config, args.limit, failed=args.failed, cwd=args.cwd,
+                         since=args.since, grep=args.grep))
     elif command == "clear":
         from terminalghost.cli.logview import cmd_clear
 
         sys.exit(cmd_clear(config, args.last, args.yes))
+    elif command == "export":
+        from terminalghost.cli.transfer import cmd_export
+
+        sys.exit(cmd_export(config, args.out))
+    elif command == "import":
+        from terminalghost.cli.transfer import cmd_import
+
+        sys.exit(cmd_import(config, args.file))
+    elif command == "redact-check":
+        sys.exit(_cmd_redact_check(config, " ".join(args.text)))
     elif command == "uninstall":
         from terminalghost.cli.init import cmd_uninstall
 
@@ -596,6 +660,9 @@ def _cmd_start(config: Config, config_path: str | None) -> int:
         print(f"daemon failed to start; see {log_path}", file=sys.stderr)
         return 1
     _show_banner(config)
+    from rich.markup import escape
+
+    from terminalghost.cli.tips import random_tip
     from terminalghost.ui import console_for
 
     console = console_for(config)
@@ -604,6 +671,7 @@ def _cmd_start(config: Config, config_path: str | None) -> int:
         f"[tg.success]✓[/] daemon started (pid {real_pid}), listening on "
         f"[tg.key]{config.general.host}:{port}[/]"
     )
+    console.print(f"[tg.muted]tip: {escape(random_tip())}[/]")
     return 0
 
 

@@ -163,22 +163,26 @@ def _post_answer_actions(config: "Config") -> None:
     from rich.panel import Panel
     from rich.text import Text
 
+    from terminalghost.cli.risk import assess
     from terminalghost.ui import console_for
 
     command = _fetch_suggestion(config)
     if not command:
         return
     console = console_for(config)
+    warning = assess(command)
     console.print(
         Panel(
             Text(command, style="tg.cmd"),
-            title="▶ run this",
+            title="⚠ run this (risky)" if warning else "▶ run this",
             title_align="left",
-            border_style="tg.glow",
+            border_style="tg.warn" if warning else "tg.glow",
             padding=(0, 1),
             expand=False,
         )
     )
+    if warning:
+        console.print(f"  [tg.warn]⚠ This command {warning}.[/]")
     console.print(
         "  [tg.key]R[/] run   [tg.key]C[/] copy   [tg.key]E[/] edit"
         "   [tg.muted]· any other key dismiss[/]"
@@ -190,15 +194,41 @@ def _post_answer_actions(config: "Config") -> None:
         return
     if key == "r":
         print()
-        _cmd_exec(config, command)
+        if _run_confirmed(config, command):
+            _cmd_exec(config, command)
     elif key == "c":
         _copy_to_clipboard(command, config)
     elif key == "e":
         edited = _edit_command(command).strip()
-        if edited:
+        if edited and _run_confirmed(config, edited):
             _cmd_exec(config, edited)
     else:
         print()  # dismiss — leave a clean line
+
+
+def _run_confirmed(config: "Config", command: str) -> bool:
+    """Gate risky commands behind a typed confirmation. True = go ahead.
+
+    Safe commands pass straight through — one-keypress speed is the point.
+    Destructive-looking ones (see cli.risk) must be confirmed by typing "yes".
+    """
+    from terminalghost.cli.risk import assess
+    from terminalghost.ui import console_for
+
+    warning = assess(command)
+    if warning is None:
+        return True
+    console = console_for(config)
+    console.print(f"[tg.warn]⚠ This command {warning}.[/]")
+    try:
+        answer = input('Type "yes" to run it: ').strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    if answer != "yes":
+        console.print("[tg.muted]Skipped.[/]")
+        return False
+    return True
 
 
 def _read_key() -> str:
@@ -331,9 +361,15 @@ def _fetch_suggestion(config: "Config") -> str:
 
 
 def _cmd_apply(config: "Config", assume_yes: bool = False) -> int:
-    """Run the command TerminalGhost last suggested, after confirmation."""
+    """Run the command TerminalGhost last suggested, after confirmation.
+
+    Destructive-looking suggestions (see cli.risk) always show a plain-language
+    warning and, unless --yes was given, need a typed "yes" instead of a
+    one-letter confirmation.
+    """
     from rich.markup import escape
 
+    from terminalghost.cli.risk import assess
     from terminalghost.ui import console_for
 
     console = console_for(config)
@@ -346,6 +382,9 @@ def _cmd_apply(config: "Config", assume_yes: bool = False) -> int:
         return 0
 
     console.print(f"[tg.header]Suggested:[/] [tg.cmd]{escape(command)}[/]")
+    warning = assess(command)
+    if warning:
+        console.print(f"[tg.warn]⚠ This command {warning}.[/]")
     if not assume_yes:
         if not sys.stdin.isatty():
             console.print(
@@ -353,12 +392,14 @@ def _cmd_apply(config: "Config", assume_yes: bool = False) -> int:
                 "Re-run with [tg.key]--yes[/]."
             )
             return 1
+        prompt = 'Type "yes" to run it: ' if warning else "Run it? [y/N] "
         try:
-            answer = input("Run it? [y/N] ").strip().lower()
+            answer = input(prompt).strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             return 130
-        if answer not in ("y", "yes"):
+        accepted = ("yes",) if warning else ("y", "yes")
+        if answer not in accepted:
             console.print("[tg.muted]Skipped.[/]")
             return 0
     # The suggestion is already a shell-ready command line; run it as-is.

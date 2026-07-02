@@ -76,6 +76,11 @@ runs through the same capture path, so you can immediately `qq` again if it fail
 (For zero-effort ambient capture on Linux/macOS, see the experimental
 `TG_CAPTURE_OUTPUT` option below.)
 
+**Destructive suggestions are gated.** If the suggested command looks dangerous
+(`rm -rf`, `git push --force`, `git reset --hard`, `dd`, piping a download into a
+shell, `DROP TABLE`, …), TerminalGhost shows a plain-language warning of what it
+would do and requires you to type `yes` — a single keypress or `y` won't run it.
+
 ## Commands
 
 ```
@@ -86,6 +91,11 @@ terminalghost stop        # stop it
 terminalghost status      # running / stopped
 terminalghost restart
 terminalghost log [-n N]  # show recently captured commands
+                          #   filter: --failed, --cwd [DIR], --since 2h, --grep <text>
+terminalghost clear       # forget captured history (--last N for just the newest N)
+terminalghost export      # dump history as JSON (pipe or -o FILE) to move machines
+terminalghost import <f>  # load an exported snapshot into this machine's history
+terminalghost redact-check <cmd>  # preview what would be stored — nothing is saved
 terminalghost enable      # start the daemon automatically at login
 terminalghost disable     # undo enable
 terminalghost uninstall   # remove the shell hook block from your profile
@@ -151,6 +161,11 @@ sends assembled context to that provider — your choice, off by default.
 To make TerminalGhost forget what it captured, run **`terminalghost clear`** (everything)
 or `terminalghost clear --last N` (just the last N commands — handy right after typing
 a secret). The database is vacuumed so deleted text actually leaves the file.
+
+Don't take redaction on faith — check it: **`terminalghost redact-check "export TOKEN=abc123"`**
+shows exactly what would be stored for any command, without saving anything. Rows where
+redaction fired are highlighted in `terminalghost log`, and history snapshots
+(`export`/`import`) only ever contain the already-redacted text.
 
 ## Development
 

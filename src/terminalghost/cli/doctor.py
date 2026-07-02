@@ -156,6 +156,15 @@ def cmd_doctor(config) -> int:
     console.print()
     if failed == 0:
         console.print("[tg.success]Everything looks good.[/]")
+        _print_tip(console)
         return 0
     console.print(f"[tg.warn]{failed} issue(s) found.[/] See fixes above.")
     return 1
+
+
+def _print_tip(console) -> None:
+    from rich.markup import escape
+
+    from terminalghost.cli.tips import random_tip
+
+    console.print(f"[tg.muted]tip: {escape(random_tip())}[/]")

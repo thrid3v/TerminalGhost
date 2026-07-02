@@ -110,6 +110,66 @@ def test_get_last_error_returns_most_recent_failure(db):
     assert error.cmd == "fail-2"
 
 
+# -- history filters -----------------------------------------------------------------
+
+
+def _insert_filter_fixture(db):
+    now = time.time()
+    db.insert_command(CommandEvent(
+        session_id=1, ts=now - 7200, cwd="/proj-a", cmd="docker build .",
+        exit_code=1, duration_ms=10,
+    ))
+    db.insert_command(CommandEvent(
+        session_id=1, ts=now - 60, cwd="/proj-b", cmd="docker run app",
+        exit_code=0, duration_ms=10,
+    ))
+    db.insert_command(CommandEvent(
+        session_id=1, ts=now - 30, cwd="/proj-a", cmd="make test",
+        exit_code=2, duration_ms=10,
+    ))
+    return now
+
+
+def test_filter_failed_only(db):
+    _insert_filter_fixture(db)
+    failed = db.get_recent_commands(failed_only=True)
+    assert [e.cmd for e in failed] == ["make test", "docker build ."]
+
+
+def test_filter_by_cwd(db):
+    _insert_filter_fixture(db)
+    in_a = db.get_recent_commands(cwd="/proj-a")
+    assert [e.cmd for e in in_a] == ["make test", "docker build ."]
+    assert db.get_recent_commands(cwd="/nowhere") == []
+
+
+def test_filter_since(db):
+    now = _insert_filter_fixture(db)
+    recent = db.get_recent_commands(since=now - 120)
+    assert [e.cmd for e in recent] == ["make test", "docker run app"]
+
+
+def test_filter_grep_case_insensitive_substring(db):
+    _insert_filter_fixture(db)
+    hits = db.get_recent_commands(grep="DOCKER")
+    assert [e.cmd for e in hits] == ["docker run app", "docker build ."]
+
+
+def test_filter_grep_escapes_like_wildcards(db):
+    db.insert_command(make_event(cmd="echo 100%"))
+    db.insert_command(make_event(cmd="echo hundred"))
+    hits = db.get_recent_commands(grep="100%")
+    assert [e.cmd for e in hits] == ["echo 100%"]
+    # a bare % must not act as match-everything
+    assert db.get_recent_commands(grep="%hundred%") == []
+
+
+def test_filters_combine(db):
+    _insert_filter_fixture(db)
+    hits = db.get_recent_commands(failed_only=True, cwd="/proj-a", grep="docker")
+    assert [e.cmd for e in hits] == ["docker build ."]
+
+
 # -- clear ---------------------------------------------------------------------------
 
 

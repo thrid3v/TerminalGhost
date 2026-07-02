@@ -97,6 +97,53 @@ def test_redact_output_masks_secret_lines():
     assert "<redacted>" in redacted
 
 
+# -- redact-check dry-run -----------------------------------------------------
+
+
+def _no_color_config():
+    import dataclasses
+
+    from terminalghost.config.loader import Config
+
+    cfg = Config()
+    return dataclasses.replace(cfg, ui=dataclasses.replace(cfg.ui, color="never"))
+
+
+def test_redact_check_flags_secret(capsys):
+    from terminalghost.daemon.process import _cmd_redact_check
+
+    rc = _cmd_redact_check(_no_color_config(), "export API_KEY=sk-live12345678901234")
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Secrets detected" in out
+    assert "<redacted>" in out
+    assert "sk-live12345678901234" not in out
+
+
+def test_redact_check_clean_command(capsys):
+    from terminalghost.daemon.process import _cmd_redact_check
+
+    rc = _cmd_redact_check(_no_color_config(), "git status")
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "No secrets detected" in out
+    assert "git status" in out
+
+
+def test_redact_check_warns_when_redaction_disabled(capsys):
+    import dataclasses
+
+    from terminalghost.daemon.process import _cmd_redact_check
+
+    cfg = _no_color_config()
+    cfg = dataclasses.replace(
+        cfg, capture=dataclasses.replace(cfg.capture, redact_passwords=False)
+    )
+    rc = _cmd_redact_check(cfg, "anything")
+    assert rc == 1
+    assert "disabled" in capsys.readouterr().out
+
+
 # -- ?? query text is stored redacted ----------------------------------------
 
 
