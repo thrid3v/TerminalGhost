@@ -142,6 +142,8 @@ function ?? { terminalghost ask "$@"; }
 function tg { if [ -t 0 ]; then terminalghost ask "$@"; else terminalghost explain; fi; }
 
 # tgr <cmd> — run a command with its output captured for the next ??.
-# tga — run the command TerminalGhost last suggested (asks first).
+# tga [name] — run the last suggested fix, or a saved one (asks first).
+# tgs <name> — save the last suggested fix under a name.
 function tgr { terminalghost exec "$@"; }
 function tga { terminalghost apply "$@"; }
+function tgs { terminalghost save "$@"; }

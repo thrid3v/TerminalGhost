@@ -29,6 +29,7 @@ import psutil
 
 from terminalghost.capture.shell_hooks import HookReceiver
 from terminalghost.config.loader import Config, ConfigError, load_config
+from terminalghost.config.project import load_project_overrides
 from terminalghost.context.assembler import ContextAssembler
 from terminalghost.llm.base import get_backend
 from terminalghost.runtime import (
@@ -122,20 +123,26 @@ class Daemon:
         assert self._db is not None
         event.session_id = self._session_for(shell_pid, shell)
         cap = self._config.capture
+        # Repo-local .terminalghost.toml can only tighten these settings.
+        proj = load_project_overrides(event.cwd)
         # Output: privacy gate first. Ambient hook output needs capture_output;
-        # explicit `terminalghost exec` (source="run") is always kept. Blocked
-        # commands never store output regardless.
-        keep_output = (cap.capture_output or event.source == "run") and not self._is_blocked(
-            event.cmd
+        # explicit `terminalghost exec` (source="run") is normally kept, but a
+        # project-level opt-out silences even that (the repo is sensitive).
+        # Blocked commands never store output regardless.
+        keep_output = (
+            (cap.capture_output or event.source == "run")
+            and not proj.capture_output_off
+            and not self._is_blocked(event.cmd, proj.extra_blocked)
         )
+        redact = cap.redact_passwords or proj.redact_passwords_on
         if not keep_output:
             event.output = None
         elif event.output:
             event.output = _trim_output(event.output, cap.output_max_lines)
-            if cap.redact_passwords:
+            if redact:
                 event.output = _redact_output(event.output)
         # Redact secrets that live in the command text itself (tokens, creds-in-URLs).
-        if cap.redact_passwords:
+        if redact:
             event.cmd = _redact_command(event.cmd)
         self._db.insert_command(event)
 
@@ -145,7 +152,10 @@ class Daemon:
         # Redact the stored copy like any other command (`?? my TOKEN=... fails`);
         # the live query keeps the original text — the user typed it for the LLM.
         stored_cmd = cmd
-        if self._config.capture.redact_passwords:
+        if (
+            self._config.capture.redact_passwords
+            or load_project_overrides(cwd).redact_passwords_on
+        ):
             stored_cmd = _redact_command(cmd)
         self._db.insert_command(
             CommandEvent(
@@ -197,8 +207,8 @@ class Daemon:
             )
         return self._sessions[shell_pid]
 
-    def _is_blocked(self, cmd: str) -> bool:
-        for pattern in self._config.capture.blocked_commands:
+    def _is_blocked(self, cmd: str, extra: tuple[str, ...] = ()) -> bool:
+        for pattern in (*self._config.capture.blocked_commands, *extra):
             try:
                 if re.search(pattern, cmd):
                     return True
@@ -423,10 +433,22 @@ def main() -> None:
     )
     exec_p.add_argument("cmd", nargs=argparse.REMAINDER, help="the command to run")
     apply_p = sub.add_parser(
-        "apply", help="run the command TerminalGhost last suggested (alias: tga)"
+        "apply", help="run the last suggested fix, or a saved one (alias: tga)"
     )
+    apply_p.add_argument("name", nargs="?", default=None,
+                         help="a saved fix to run (see: terminalghost fixes)")
     apply_p.add_argument("-y", "--yes", action="store_true",
                          help="run without confirmation")
+    save_p = sub.add_parser(
+        "save", help="save the last suggested fix under a name (alias: tgs)"
+    )
+    save_p.add_argument("name", help="name for the fix, e.g. jest-cache")
+    save_p.add_argument("-n", "--note", default="", help="what this fixes")
+    fixes_p = sub.add_parser("fixes", help="list saved fixes (your personal runbook)")
+    fixes_p.add_argument("--grep", default=None, metavar="TEXT",
+                         help="only fixes whose name/commands contain TEXT")
+    fixes_p.add_argument("--delete", default=None, metavar="NAME",
+                         help="delete the named fix")
 
     sub.add_parser("hint", help="print a one-line proactive hint for the last failure")
     recap_p = sub.add_parser(
@@ -526,7 +548,15 @@ def main() -> None:
     elif command == "apply":
         from terminalghost.cli import client
 
-        sys.exit(client._cmd_apply(config, assume_yes=args.yes))
+        sys.exit(client._cmd_apply(config, assume_yes=args.yes, name=args.name))
+    elif command == "save":
+        from terminalghost.cli.fixes import cmd_save
+
+        sys.exit(cmd_save(config, args.name, note=args.note))
+    elif command == "fixes":
+        from terminalghost.cli.fixes import cmd_fixes
+
+        sys.exit(cmd_fixes(config, grep=args.grep, delete=args.delete))
     elif command == "init":
         from terminalghost.cli.init import cmd_init
 

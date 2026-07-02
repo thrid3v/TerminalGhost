@@ -490,8 +490,9 @@ def _fetch_suggestion(config: "Config") -> str:
     return _request(config, {"type": "suggestion"})
 
 
-def _cmd_apply(config: "Config", assume_yes: bool = False) -> int:
-    """Run the command TerminalGhost last suggested, after confirmation.
+def _cmd_apply(config: "Config", assume_yes: bool = False,
+               name: str | None = None) -> int:
+    """Run the last suggested fix — or a saved one (`apply <name>`).
 
     Destructive-looking suggestions (see cli.risk) always show a plain-language
     warning and, unless --yes was given, need a typed "yes" instead of a
@@ -503,7 +504,19 @@ def _cmd_apply(config: "Config", assume_yes: bool = False) -> int:
     from terminalghost.ui import console_for
 
     console = console_for(config)
-    commands = _suggested_commands(config)
+    if name:
+        from terminalghost.cli.fixes import load_fix_commands
+
+        commands = load_fix_commands(config, name) or []
+        if not commands:
+            console.print(
+                f"[tg.error]No saved fix named {escape(name)!s}.[/] "
+                "See [tg.key]terminalghost fixes[/]."
+            )
+            return 1
+        console.print(f"[tg.header]Saved fix [tg.key]{escape(name)}[/]:[/]")
+    else:
+        commands = _suggested_commands(config)
     if not commands:
         console.print(
             "[tg.muted]Nothing to apply yet — ask a [tg.key]??[/] first "

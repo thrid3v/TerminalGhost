@@ -90,9 +90,13 @@ class ContextAssembler:
         # newest-first from the DB; the prompt wants oldest-first
         commands = list(reversed(self._db.get_recent_commands(limit=HISTORY_FETCH_LIMIT)))
         tree = self._format_directory_tree(cwd)
+        # A repo-local .terminalghost.toml can opt this project out.
+        from terminalghost.config.project import load_project_overrides
+
         project = (
             self._format_project_context(cwd)
             if self._config.context.project_context
+            and not load_project_overrides(cwd).project_context_off
             else None
         )
         preamble = _PREAMBLE + _INTENT_SUFFIX.get(intent, "")

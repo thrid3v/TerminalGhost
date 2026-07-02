@@ -126,8 +126,10 @@ add-zsh-hook precmd _tg_precmd
 }
 
 # tgr <cmd> — run a command with its output captured for the next ??.
-# tga — run the command TerminalGhost last suggested (asks first).
+# tga [name] — run the last suggested fix, or a saved one (asks first).
+# tgs <name> — save the last suggested fix under a name.
 tgr() { terminalghost exec "$@" }
 tga() { terminalghost apply "$@" }
+tgs() { terminalghost save "$@" }
 # tg: ask normally, but explain piped input (e.g. `make 2>&1 | tg`).
 tg() { if [[ -t 0 ]]; then terminalghost ask "$@"; else terminalghost explain; fi }

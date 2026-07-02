@@ -26,6 +26,8 @@ TIPS: tuple[str, ...] = (
     "themes: terminalghost theme light (or high-contrast)",
     "`terminalghost recap` writes your standup note: what broke, what fixed it",
     "multi-command fixes step through one at a time — skip or quit any step",
+    "a fix worked? `tgs <name>` saves it; `tga <name>` replays it anytime",
+    "drop a .terminalghost.toml in a sensitive repo to tighten privacy there",
 )
 
 

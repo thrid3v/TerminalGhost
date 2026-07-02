@@ -18,6 +18,12 @@
 #                   used, so a custom or ephemeral (port = 0) config just
 #                   works; else 48632.
 #   $env:TG_HINTS — set to '1' for a proactive one-line hint after a failure.
+#   $env:TG_CAPTURE_OUTPUT — set to '1' to transcribe the session
+#       (Start-Transcript) and send each command's output with its event.
+#       The daemon stores output only when capture.capture_output = true.
+#       Caveat: Windows PowerShell 5.1 transcripts miss most native .exe
+#       console output (PowerShell 7+ captures it) — `tgr <cmd>` remains the
+#       guaranteed way to capture a native command's output.
 
 if (-not $env:TG_HOST) { $env:TG_HOST = '127.0.0.1' }
 
@@ -34,15 +40,57 @@ function global:Get-TerminalGhostPort {
 
 $global:__TG_LastHistoryId = (Get-History -Count 1).Id
 
+# --- Optional output capture (EXPERIMENTAL, opt-in) -------------------------
+# The PowerShell analog of the POSIX `script` wrapper: transcribe the session
+# and tail the delta per command. Silently disabled if a transcript is
+# already running (e.g. corporate logging policy).
+$global:__TG_Transcript = $null
+$global:__TG_TranscriptOffset = 0
+if ($env:TG_CAPTURE_OUTPUT -eq '1') {
+    $global:__TG_Transcript = Join-Path ([IO.Path]::GetTempPath()) "tg-capture.$PID.log"
+    try {
+        Start-Transcript -Path $global:__TG_Transcript -Force | Out-Null
+        # Skip past the transcript header block.
+        $global:__TG_TranscriptOffset = (Get-Item $global:__TG_Transcript -ErrorAction Stop).Length
+    } catch {
+        $global:__TG_Transcript = $null
+    }
+}
+
+function global:Get-TerminalGhostOutput {
+    # The transcript text appended since the last prompt (= last command's
+    # output), with transcript metadata lines stripped; '' when unavailable.
+    if (-not $global:__TG_Transcript) { return '' }
+    try {
+        $fs = [IO.File]::Open($global:__TG_Transcript, 'Open', 'Read', 'ReadWrite')
+        try {
+            $len = $fs.Length
+            if ($len -le $global:__TG_TranscriptOffset) { return '' }
+            [void]$fs.Seek($global:__TG_TranscriptOffset, 'Begin')
+            $buf = New-Object byte[] ($len - $global:__TG_TranscriptOffset)
+            [void]$fs.Read($buf, 0, $buf.Length)
+            $global:__TG_TranscriptOffset = $len
+        } finally { $fs.Close() }
+        $text = [Text.Encoding]::UTF8.GetString($buf)
+        $lines = ($text -split "`r?`n") | Where-Object {
+            $_ -notmatch '^\*{15,}$' -and
+            $_ -notmatch '^(Windows PowerShell transcript|Command start time:|Start time:|End time:|Username:|RunAs User:|Machine:|Host Application:|Process ID:|PSVersion|PSEdition|PSCompatibleVersions|BuildVersion|CLRVersion|WSManStackVersion|PSRemotingProtocolVersion|SerializationVersion|Configuration Name:)'
+        }
+        $joined = (($lines | Select-Object -Last 40) -join "`n").Trim()
+        if ($joined.Length -gt 4000) { $joined = $joined.Substring($joined.Length - 4000) }
+        return $joined
+    } catch { return '' }
+}
+
 function global:Send-TerminalGhostEvent {
-    param([string]$Cmd, [int]$ExitCode, [int]$DurationMs)
+    param([string]$Cmd, [int]$ExitCode, [int]$DurationMs, [string]$CmdOutput = '')
     try {
         $token = ''
         try {
             $tokenFile = Join-Path $HOME '.local\share\terminalghost\token'
             $token = (Get-Content $tokenFile -Raw -ErrorAction Stop).Trim()
         } catch { }
-        $payload = (@{
+        $data = @{
             cmd      = $Cmd
             exit     = [Math]::Max(0, [Math]::Min(255, $ExitCode))
             cwd      = (Get-Location).Path
@@ -51,7 +99,9 @@ function global:Send-TerminalGhostEvent {
             pid      = $PID
             shell    = 'powershell'
             token    = $token
-        } | ConvertTo-Json -Compress) + "`n"
+        }
+        if ($CmdOutput) { $data.output = $CmdOutput }
+        $payload = ($data | ConvertTo-Json -Compress) + "`n"
 
         $client = New-Object System.Net.Sockets.TcpClient
         $connect = $client.BeginConnect($env:TG_HOST, (Get-TerminalGhostPort), $null, $null)
@@ -79,7 +129,10 @@ function global:prompt {
             $exitCode = if ($global:LASTEXITCODE) { $global:LASTEXITCODE } else { 1 }
         }
         $duration = [int]($entry.EndExecutionTime - $entry.StartExecutionTime).TotalMilliseconds
-        Send-TerminalGhostEvent -Cmd $entry.CommandLine -ExitCode $exitCode -DurationMs $duration
+        $cmdOutput = ''
+        if ($global:__TG_Transcript) { $cmdOutput = Get-TerminalGhostOutput }
+        Send-TerminalGhostEvent -Cmd $entry.CommandLine -ExitCode $exitCode `
+            -DurationMs $duration -CmdOutput $cmdOutput
         # Opt-in proactive hint after a failure (TG_HINTS=1). Blocks briefly;
         # the hint client is silent when the daemon/model has nothing to say.
         if ($env:TG_HINTS -eq '1' -and $exitCode -ne 0) {
@@ -92,9 +145,11 @@ function global:prompt {
 function global:qq { terminalghost ask @args }
 
 # tgr <cmd> — run a command with its output captured for the next qq/??.
-# tga — run the command TerminalGhost last suggested (asks first).
+# tga [name] — run the last suggested fix, or a saved one (asks first).
+# tgs <name> — save the last suggested fix under a name.
 function global:tgr { terminalghost exec @args }
 function global:tga { terminalghost apply @args }
+function global:tgs { terminalghost save @args }
 # tg: ask normally, but explain piped input (e.g. `make 2>&1 | tg`).
 function global:tg {
   if ([Console]::IsInputRedirected) { $input | terminalghost explain } else { terminalghost ask @args }

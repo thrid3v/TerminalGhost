@@ -42,7 +42,34 @@ class CommandEvent:
     source: str | None = None
 
 
+@dataclass
+class Fix:
+    """A named, reusable fix saved from a ?? suggestion (personal runbook)."""
+
+    name: str
+    commands: list[str]
+    note: str = ""
+    cwd: str = ""
+    created_ts: float = 0.0
+    last_used_ts: float | None = None
+    id: int | None = None
+
+
 _COLUMNS = "id, session_id, ts, cwd, cmd, exit_code, duration_ms, output"
+_FIX_COLUMNS = "id, name, commands, note, cwd, created_ts, last_used_ts"
+
+
+def _row_to_fix(row: tuple) -> Fix:
+    (row_id, name, commands, note, cwd, created_ts, last_used_ts) = row
+    return Fix(
+        name=name,
+        commands=commands.splitlines(),
+        note=note,
+        cwd=cwd,
+        created_ts=created_ts,
+        last_used_ts=last_used_ts,
+        id=row_id,
+    )
 
 
 def _row_to_event(row: sqlite3.Row | tuple) -> CommandEvent:
@@ -95,6 +122,7 @@ class Database:
             conn.execute(schema.CREATE_VERSION_TABLE)
             conn.execute(schema.CREATE_SESSIONS_TABLE)
             conn.execute(schema.CREATE_COMMANDS_TABLE)
+            conn.execute(schema.CREATE_FIXES_TABLE)
             for index_sql in schema.INDEXES:
                 conn.execute(index_sql)
             self._run_migrations(conn)
@@ -228,6 +256,66 @@ class Database:
             except sqlite3.OperationalError:
                 pass  # e.g. another connection holds the file — data is gone anyway
         return deleted
+
+    # -- saved fixes -----------------------------------------------------------
+
+    def save_fix(self, name: str, commands: list[str], note: str = "",
+                 cwd: str = "") -> None:
+        """Save (or overwrite) a named fix. Raises ValueError on empty input."""
+        name = name.strip()
+        commands = [c.strip() for c in commands if c.strip()]
+        if not name:
+            raise ValueError("fix name must not be empty")
+        if not commands:
+            raise ValueError("fix must contain at least one command")
+        conn = self._require_conn()
+        with self._lock, conn:
+            conn.execute(
+                "INSERT INTO fixes (name, commands, note, cwd, created_ts)"
+                " VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT(name) DO UPDATE SET"
+                "  commands=excluded.commands, note=excluded.note,"
+                "  cwd=excluded.cwd, created_ts=excluded.created_ts,"
+                "  last_used_ts=NULL",
+                (name, "\n".join(commands), note, cwd, time.time()),
+            )
+
+    def get_fix(self, name: str) -> Fix | None:
+        conn = self._require_conn()
+        with self._lock:
+            row = conn.execute(
+                f"SELECT {_FIX_COLUMNS} FROM fixes WHERE name = ?", (name.strip(),)
+            ).fetchone()
+        return _row_to_fix(row) if row else None
+
+    def list_fixes(self, grep: str | None = None) -> list[Fix]:
+        """All saved fixes, most recently used/created first."""
+        conn = self._require_conn()
+        query = f"SELECT {_FIX_COLUMNS} FROM fixes"
+        params: tuple = ()
+        if grep:
+            needle = grep.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            query += " WHERE name LIKE ? ESCAPE '\\' OR commands LIKE ? ESCAPE '\\'"
+            params = (f"%{needle}%", f"%{needle}%")
+        query += " ORDER BY COALESCE(last_used_ts, created_ts) DESC"
+        with self._lock:
+            rows = conn.execute(query, params).fetchall()
+        return [_row_to_fix(row) for row in rows]
+
+    def delete_fix(self, name: str) -> bool:
+        conn = self._require_conn()
+        with self._lock, conn:
+            cursor = conn.execute("DELETE FROM fixes WHERE name = ?", (name.strip(),))
+            return cursor.rowcount > 0
+
+    def touch_fix(self, name: str) -> None:
+        """Record that a fix was just used (for most-recently-used ordering)."""
+        conn = self._require_conn()
+        with self._lock, conn:
+            conn.execute(
+                "UPDATE fixes SET last_used_ts = ? WHERE name = ?",
+                (time.time(), name.strip()),
+            )
 
     # -- sessions ------------------------------------------------------------
 
