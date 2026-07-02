@@ -31,6 +31,7 @@ class Collector:
     def __init__(self):
         self.events: list[tuple[CommandEvent, int | None, str | None]] = []
         self.queries: list[tuple[str, str]] = []
+        self.recaps: list[float] = []
         self.got_event = asyncio.Event()
 
     async def on_event(self, event, shell_pid, shell):
@@ -42,11 +43,18 @@ class Collector:
         await send("ANSWER for ")
         await send(cmd)
 
+    async def on_recap(self, since, send):
+        self.recaps.append(since)
+        await send(f"RECAP since {since}")
+
 
 @pytest.fixture
 async def receiver():
     collector = Collector()
-    recv = HookReceiver("127.0.0.1", 0, collector.on_event, collector.on_query)
+    recv = HookReceiver(
+        "127.0.0.1", 0, collector.on_event, collector.on_query,
+        on_recap=collector.on_recap,
+    )
     await recv.start()
     yield recv, collector
     await recv.stop()
@@ -204,3 +212,25 @@ async def test_query_streams_response_back(receiver):
     writer.close()
     assert response.decode() == "ANSWER for ?? why fail"
     assert collector.queries == [("?? why fail", "/proj")]
+
+
+async def test_recap_streams_response_back(receiver):
+    recv, collector = receiver
+    reader, writer = await connect(recv)
+    writer.write((json.dumps({"type": "recap", "since": 1234.5}) + "\n").encode())
+    await writer.drain()
+    response = await asyncio.wait_for(reader.read(), timeout=2)
+    writer.close()
+    assert response.decode() == "RECAP since 1234.5"
+    assert collector.recaps == [1234.5]
+
+
+async def test_recap_invalid_since_ignored(receiver):
+    recv, collector = receiver
+    reader, writer = await connect(recv)
+    writer.write((json.dumps({"type": "recap", "since": "yesterday"}) + "\n").encode())
+    await writer.drain()
+    response = await asyncio.wait_for(reader.read(), timeout=2)
+    writer.close()
+    assert response == b""  # rejected silently, connection just closes
+    assert collector.recaps == []

@@ -90,6 +90,9 @@ class ContextConfig:
         default_factory=lambda: [".git", "__pycache__", "node_modules", ".venv"]
     )
     token_budget: int = 3000
+    # Fold project facts (git branch/dirty state, manifest snippets like
+    # package.json deps) into the prompt automatically.
+    project_context: bool = True
 
 
 @dataclass(frozen=True)
@@ -112,6 +115,9 @@ class UIConfig:
     banner: bool = True
     # Render streamed ?? answers as live markdown (vs. plain streamed text).
     markdown: bool = True
+    # Ring the terminal bell (and send a desktop notification where available)
+    # when an answer took longer than this many seconds. 0 disables it.
+    notify_after_seconds: int = 20
 
 
 @dataclass(frozen=True)

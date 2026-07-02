@@ -9,8 +9,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import subprocess
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -21,11 +23,24 @@ log = logging.getLogger(__name__)
 
 TREE_ENTRY_CAP = 200
 HISTORY_FETCH_LIMIT = 50
+# Hard cap on the auto project-context section so a giant manifest can't
+# crowd out command history in the token budget.
+PROJECT_CONTEXT_MAX_CHARS = 900
+_GIT_TIMEOUT = 1.0  # seconds; a slow repo must not stall the query
+_MANIFEST_DEP_CAP = 12  # dependencies listed per manifest
 
 _PREAMBLE = (
     "You are TerminalGhost, an assistant that lives in the user's terminal.\n"
     "Using the shell context below, give a concise, actionable answer.\n"
     "If a command failed, explain why and give the exact fix command first."
+)
+
+_RECAP_PREAMBLE = (
+    "You are TerminalGhost. Summarize this terminal session from the command\n"
+    "log below: what was attempted, what failed, and what fixed it. Reply with\n"
+    "a short bullet list grouped by task, then one line of key takeaways —\n"
+    "useful for a standup note or a PR description. Do not invent commands\n"
+    "that are not in the log."
 )
 
 # Extra instruction appended to the preamble for `?? fix` / `?? explain`.
@@ -75,6 +90,15 @@ class ContextAssembler:
         # newest-first from the DB; the prompt wants oldest-first
         commands = list(reversed(self._db.get_recent_commands(limit=HISTORY_FETCH_LIMIT)))
         tree = self._format_directory_tree(cwd)
+        # A repo-local .terminalghost.toml can opt this project out.
+        from terminalghost.config.project import load_project_overrides
+
+        project = (
+            self._format_project_context(cwd)
+            if self._config.context.project_context
+            and not load_project_overrides(cwd).project_context_off
+            else None
+        )
         preamble = _PREAMBLE + _INTENT_SUFFIX.get(intent, "")
 
         def build(cmds: list, tree_text: str) -> str:
@@ -88,6 +112,8 @@ class ContextAssembler:
                 parts.append(self._format_last_error(last_error))
             if cmds:
                 parts.append(self._format_command_history(cmds, last_error))
+            if project:
+                parts.append(project)
             parts.append(f"## Current directory: {cwd}\n{tree_text}")
             if inline_context:
                 parts.append(f"## User note\n{inline_context}")
@@ -103,6 +129,29 @@ class ContextAssembler:
         while self._estimate_tokens(prompt) > budget and len(tree_lines) > 1:
             tree_lines = tree_lines[: len(tree_lines) // 2]
             prompt = build(commands, "\n".join(tree_lines) + "\n(truncated)")
+        return prompt
+
+    def assemble_recap(self, since: float) -> str | None:
+        """Prompt asking for a session summary of commands newer than `since`.
+
+        Global (not cwd-scoped): a terminal session usually spans directories.
+        Returns None when nothing was captured in the window.
+        """
+        budget = self._config.context.token_budget
+        commands = list(reversed(self._db.get_recent_commands(
+            limit=self._config.general.history_size, since=since,
+        )))
+        if not commands:
+            return None
+
+        def build(cmds: list) -> str:
+            return _RECAP_PREAMBLE + "\n\n" + self._format_command_history(cmds, None)
+
+        prompt = build(commands)
+        # Trim oldest first — the end of the session matters most.
+        while self._estimate_tokens(prompt) > budget and len(commands) > 1:
+            commands.pop(0)
+            prompt = build(commands)
         return prompt
 
     # -- formatting helpers ----------------------------------------------------
@@ -133,6 +182,32 @@ class ContextAssembler:
             lines.append("output:")
             lines.extend(event.output.splitlines()[:20])
         return "\n".join(lines)
+
+    def _format_project_context(self, cwd: str) -> str | None:
+        """Auto-detected project facts: git state + manifest snippets.
+
+        Half of "why does this fail" answers hinge on versions/branch state
+        the user didn't think to mention. Everything here is best-effort and
+        hard-capped so it can't crowd out command history.
+        """
+        lines: list[str] = []
+        git = _git_summary(cwd)
+        if git:
+            lines.append(git)
+        for filename, formatter in _MANIFESTS:
+            path = os.path.join(cwd, filename)
+            if not os.path.isfile(path):
+                continue
+            try:
+                snippet = formatter(path)
+            except Exception:  # noqa: BLE001 — malformed manifests are not our problem
+                snippet = None
+            if snippet:
+                lines.append(f"{filename}: {snippet}")
+        if not lines:
+            return None
+        text = "## Project\n" + "\n".join(lines)
+        return text[:PROJECT_CONTEXT_MAX_CHARS]
 
     def _format_directory_tree(self, cwd: str) -> str:
         """Tree-style listing of cwd, depth/ignore/entry-cap limited."""
@@ -175,3 +250,109 @@ class ContextAssembler:
     def _estimate_tokens(text: str) -> int:
         """Rough estimate without a tokenizer: ~4 chars per token."""
         return len(text) // 4
+
+
+# -- project context helpers ----------------------------------------------------
+
+
+def _git_summary(cwd: str) -> str | None:
+    """One line of git state ("git: branch main, 3 changed files"), or None."""
+
+    def run(*args: str) -> str | None:
+        try:
+            result = subprocess.run(
+                ["git", "-C", cwd, *args],
+                capture_output=True, text=True, timeout=_GIT_TIMEOUT,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    branch = run("rev-parse", "--abbrev-ref", "HEAD")
+    if branch is None:
+        return None  # not a repo / git missing — silently skip
+    # -uno skips untracked scanning: much faster on big repos, and tracked
+    # modifications are what usually matters for "why does this fail".
+    status = run("status", "--porcelain", "-uno")
+    dirty = len(status.splitlines()) if status else 0
+    state = f"{dirty} changed file(s)" if dirty else "clean"
+    return f"git: branch {branch}, {state}"
+
+
+def _snippet_package_json(path: str) -> str | None:
+    with open(path, encoding="utf-8-sig") as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        return None
+    parts = []
+    if isinstance(data.get("engines"), dict):
+        parts.append("engines " + json.dumps(data["engines"]))
+    deps = data.get("dependencies")
+    if isinstance(deps, dict) and deps:
+        listed = [f"{k}@{v}" for k, v in list(deps.items())[:_MANIFEST_DEP_CAP]]
+        more = f" (+{len(deps) - _MANIFEST_DEP_CAP} more)" if len(deps) > _MANIFEST_DEP_CAP else ""
+        parts.append("deps " + ", ".join(listed) + more)
+    return "; ".join(parts) or None
+
+
+def _snippet_requirements(path: str) -> str | None:
+    with open(path, encoding="utf-8-sig") as fh:
+        reqs = [
+            line.strip() for line in fh
+            if line.strip() and not line.lstrip().startswith(("#", "-"))
+        ]
+    if not reqs:
+        return None
+    more = f" (+{len(reqs) - _MANIFEST_DEP_CAP} more)" if len(reqs) > _MANIFEST_DEP_CAP else ""
+    return ", ".join(reqs[:_MANIFEST_DEP_CAP]) + more
+
+
+def _snippet_pyproject(path: str) -> str | None:
+    import tomllib
+
+    with open(path, "rb") as fh:
+        data = tomllib.load(fh)
+    project = data.get("project")
+    if not isinstance(project, dict):
+        return None
+    parts = []
+    if project.get("requires-python"):
+        parts.append(f"requires-python {project['requires-python']}")
+    deps = project.get("dependencies")
+    if isinstance(deps, list) and deps:
+        listed = [str(d) for d in deps[:_MANIFEST_DEP_CAP]]
+        more = f" (+{len(deps) - _MANIFEST_DEP_CAP} more)" if len(deps) > _MANIFEST_DEP_CAP else ""
+        parts.append("deps " + ", ".join(listed) + more)
+    return "; ".join(parts) or None
+
+
+def _snippet_cargo(path: str) -> str | None:
+    import tomllib
+
+    with open(path, "rb") as fh:
+        data = tomllib.load(fh)
+    deps = data.get("dependencies")
+    if not isinstance(deps, dict) or not deps:
+        return None
+    names = list(deps)[:_MANIFEST_DEP_CAP]
+    more = f" (+{len(deps) - _MANIFEST_DEP_CAP} more)" if len(deps) > _MANIFEST_DEP_CAP else ""
+    return "deps " + ", ".join(names) + more
+
+
+def _snippet_go_mod(path: str) -> str | None:
+    with open(path, encoding="utf-8-sig") as fh:
+        lines = [line.strip() for line in fh if line.strip()]
+    module = next((ln for ln in lines if ln.startswith("module ")), None)
+    go_ver = next((ln for ln in lines if ln.startswith("go ")), None)
+    parts = [p for p in (module, go_ver) if p]
+    return "; ".join(parts) or None
+
+
+# Checked in order; each formatter returns a one-line snippet or None.
+_MANIFESTS: tuple[tuple[str, object], ...] = (
+    ("package.json", _snippet_package_json),
+    ("pyproject.toml", _snippet_pyproject),
+    ("requirements.txt", _snippet_requirements),
+    ("Cargo.toml", _snippet_cargo),
+    ("go.mod", _snippet_go_mod),
+)

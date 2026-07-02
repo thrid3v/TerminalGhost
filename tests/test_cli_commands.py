@@ -5,6 +5,8 @@ from __future__ import annotations
 import dataclasses
 import time
 
+import pytest
+
 from terminalghost.cli import autostart, doctor, init, logview
 from terminalghost.config.loader import Config
 from terminalghost.storage.db import CommandEvent, Database
@@ -136,6 +138,82 @@ def test_cmd_log_empty(tmp_path, capsys):
     rc = logview.cmd_log(cfg, 10)
     assert rc == 0
     assert "No commands captured" in capsys.readouterr().out
+
+
+# -- log filters --------------------------------------------------------------
+
+
+def _filter_db_config(tmp_path) -> Config:
+    db_path = str(tmp_path / "history.db")
+    db = Database(db_path)
+    db.open()
+    sid = db.start_session(123, "zsh")
+    now = time.time()
+    rows = [
+        ("docker build .", "/proj-a", 1, now - 7200),
+        ("docker run app", "/proj-b", 0, now - 60),
+        ("make TOKEN=<redacted> deploy", "/proj-a", 2, now - 30),
+    ]
+    for cmd, cwd, code, ts in rows:
+        db.insert_command(CommandEvent(session_id=sid, ts=ts, cwd=cwd, cmd=cmd,
+                                       exit_code=code, duration_ms=1))
+    db.close()
+    return dataclasses.replace(
+        Config(),
+        general=dataclasses.replace(Config().general, db_path=db_path),
+        ui=dataclasses.replace(Config().ui, color="never"),
+    )
+
+
+def test_parse_since():
+    assert time.time() - logview.parse_since("2h") == pytest.approx(7200, abs=5)
+    assert time.time() - logview.parse_since("90s") == pytest.approx(90, abs=5)
+    with pytest.raises(ValueError):
+        logview.parse_since("soon")
+    with pytest.raises(ValueError):
+        logview.parse_since("2")
+
+
+def test_cmd_log_failed_filter(tmp_path, capsys):
+    cfg = _filter_db_config(tmp_path)
+    assert logview.cmd_log(cfg, 10, failed=True) == 0
+    out = capsys.readouterr().out
+    assert "docker build" in out and "make" in out
+    assert "docker run app" not in out
+
+
+def test_cmd_log_grep_filter(tmp_path, capsys):
+    cfg = _filter_db_config(tmp_path)
+    assert logview.cmd_log(cfg, 10, grep="docker") == 0
+    out = capsys.readouterr().out
+    assert "docker build" in out and "docker run" in out
+    assert "make" not in out
+
+
+def test_cmd_log_since_filter(tmp_path, capsys):
+    cfg = _filter_db_config(tmp_path)
+    assert logview.cmd_log(cfg, 10, since="5m") == 0
+    out = capsys.readouterr().out
+    assert "docker run" in out
+    assert "docker build" not in out
+
+
+def test_cmd_log_bad_since(tmp_path, capsys):
+    cfg = _filter_db_config(tmp_path)
+    assert logview.cmd_log(cfg, 10, since="whenever") == 2
+    assert "invalid duration" in capsys.readouterr().out
+
+
+def test_cmd_log_no_matches(tmp_path, capsys):
+    cfg = _filter_db_config(tmp_path)
+    assert logview.cmd_log(cfg, 10, grep="nonexistent-xyz") == 0
+    assert "No matching commands" in capsys.readouterr().out
+
+
+def test_cmd_log_shows_redaction_marker(tmp_path, capsys):
+    cfg = _filter_db_config(tmp_path)
+    assert logview.cmd_log(cfg, 10, grep="TOKEN") == 0
+    assert "<redacted>" in capsys.readouterr().out
 
 
 # -- clear ------------------------------------------------------------------

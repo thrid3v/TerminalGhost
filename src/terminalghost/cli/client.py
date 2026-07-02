@@ -92,7 +92,22 @@ def _read_input(file: str | None) -> str:
     return data.decode("utf-8", errors="replace") if isinstance(data, bytes) else data
 
 
-def _run_query(config: "Config", payload: dict, copy: bool = False) -> int:
+def _cmd_recap(config: "Config", since: str) -> int:
+    """Ask the daemon to summarize the session (what broke, what fixed it)."""
+    from terminalghost.cli.logview import parse_since
+
+    try:
+        since_ts = parse_since(since)
+    except ValueError as exc:
+        print(f"terminalghost recap: {exc}", file=sys.stderr)
+        return 2
+    payload = {"type": "recap", "since": since_ts}
+    # No action bar: a recap is a summary, not a fix to apply.
+    return _run_query(config, payload, actions=False)
+
+
+def _run_query(config: "Config", payload: dict, copy: bool = False,
+               actions: bool = True) -> int:
     """Send a query payload to the daemon and render the streamed answer.
 
     The client runs in the user's terminal, so writing to stdout is what makes
@@ -120,6 +135,7 @@ def _run_query(config: "Config", payload: dict, copy: bool = False) -> int:
         _print_unreachable(config)
         return 1
 
+    start = time.monotonic()
     try:
         with sock:
             sock.sendall(line)
@@ -130,10 +146,12 @@ def _run_query(config: "Config", payload: dict, copy: bool = False) -> int:
                 answer = _render_answer_rich(config, sock)
             else:
                 answer = _render_answer_plain(sock)
+        # If the model took a while, the user probably tabbed away — ping them.
+        _notify_done(config, time.monotonic() - start)
         if copy and answer.strip():
             _copy_to_clipboard(answer.strip(), config)
         # Close the loop: offer to run/copy/edit the suggested command inline.
-        if use_rich and _stdin_is_tty():
+        if actions and use_rich and _stdin_is_tty():
             _post_answer_actions(config)
     except KeyboardInterrupt:
         print()
@@ -151,6 +169,44 @@ def _run_query(config: "Config", payload: dict, copy: bool = False) -> int:
     return 0
 
 
+def _notify_done(config: "Config", elapsed: float) -> None:
+    """Signal that a slow answer finished: terminal bell + desktop notification.
+
+    The bell is the reliable cross-platform 80%: most terminals flash or badge
+    the tab on BEL even when unfocused. Native notifications are best-effort
+    (macOS osascript, Linux notify-send; Windows relies on the bell).
+    """
+    threshold = config.ui.notify_after_seconds
+    if threshold <= 0 or elapsed < threshold:
+        return
+    try:
+        if sys.stdout.isatty():
+            sys.stdout.write("\a")
+            sys.stdout.flush()
+    except (AttributeError, ValueError, OSError):
+        pass
+    _native_notify("TerminalGhost", f"Answer ready ({elapsed:.0f}s)")
+
+
+def _native_notify(title: str, body: str) -> None:
+    """Best-effort desktop notification; silent on any failure."""
+    import shutil
+    import subprocess
+
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(
+                ["osascript", "-e",
+                 f'display notification "{body}" with title "{title}"'],
+                check=False, timeout=3, capture_output=True,
+            )
+        elif sys.platform.startswith("linux") and shutil.which("notify-send"):
+            subprocess.run(["notify-send", title, body],
+                           check=False, timeout=3, capture_output=True)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def _stdin_is_tty() -> bool:
     try:
         return sys.stdin.isatty()
@@ -158,31 +214,56 @@ def _stdin_is_tty() -> bool:
         return False
 
 
+def _suggested_commands(config: "Config") -> list[str]:
+    """The last suggested plan as a list of commands (newline wire format)."""
+    return [
+        line.strip()
+        for line in _fetch_suggestion(config).splitlines()
+        if line.strip()
+    ]
+
+
 def _post_answer_actions(config: "Config") -> None:
-    """Show the suggested command and an inline action bar; act on one keypress."""
+    """Show the suggested command(s) and an inline action bar; act on one keypress."""
     from rich.panel import Panel
     from rich.text import Text
 
+    from terminalghost.cli.risk import assess
     from terminalghost.ui import console_for
 
-    command = _fetch_suggestion(config)
-    if not command:
+    commands = _suggested_commands(config)
+    if not commands:
         return
     console = console_for(config)
+    multi = len(commands) > 1
+    warning = next((w for w in (assess(c) for c in commands) if w), None)
+    if multi:
+        body = Text(
+            "\n".join(f"{i}. {c}" for i, c in enumerate(commands, start=1)),
+            style="tg.cmd",
+        )
+        title = f"▶ run these ({len(commands)} steps)"
+    else:
+        body = Text(commands[0], style="tg.cmd")
+        title = "▶ run this"
+    if warning:
+        title = "⚠ " + title.split(" ", 1)[1] + " (risky)"
     console.print(
         Panel(
-            Text(command, style="tg.cmd"),
-            title="▶ run this",
+            body,
+            title=title,
             title_align="left",
-            border_style="tg.glow",
+            border_style="tg.warn" if warning else "tg.glow",
             padding=(0, 1),
             expand=False,
         )
     )
-    console.print(
-        "  [tg.key]R[/] run   [tg.key]C[/] copy   [tg.key]E[/] edit"
-        "   [tg.muted]· any other key dismiss[/]"
-    )
+    if warning:
+        console.print(f"  [tg.warn]⚠ A step here {warning}.[/]")
+    actions = "  [tg.key]R[/] run   [tg.key]C[/] copy"
+    if not multi:
+        actions += "   [tg.key]E[/] edit"
+    console.print(actions + "   [tg.muted]· any other key dismiss[/]")
     try:
         key = _read_key().lower()
     except (OSError, EOFError, KeyboardInterrupt):
@@ -190,15 +271,94 @@ def _post_answer_actions(config: "Config") -> None:
         return
     if key == "r":
         print()
-        _cmd_exec(config, command)
+        if multi:
+            _run_steps(config, commands)
+        elif _run_confirmed(config, commands[0]):
+            _cmd_exec(config, commands[0])
     elif key == "c":
-        _copy_to_clipboard(command, config)
-    elif key == "e":
-        edited = _edit_command(command).strip()
-        if edited:
+        _copy_to_clipboard("\n".join(commands), config)
+    elif key == "e" and not multi:
+        edited = _edit_command(commands[0]).strip()
+        if edited and _run_confirmed(config, edited):
             _cmd_exec(config, edited)
     else:
         print()  # dismiss — leave a clean line
+
+
+def _run_steps(config: "Config", commands: list[str], assume_yes: bool = False) -> int:
+    """Step through a multi-command plan: confirm/skip/quit per step.
+
+    Risky steps always need a typed "yes". A failing step stops the plan
+    unless the user explicitly continues. Returns the last exit code.
+    """
+    from rich.markup import escape
+
+    from terminalghost.cli.risk import assess
+    from terminalghost.ui import console_for
+
+    console = console_for(config)
+    rc = 0
+    total = len(commands)
+    for i, command in enumerate(commands, start=1):
+        console.print(f"[tg.header]step {i}/{total}:[/] [tg.cmd]{escape(command)}[/]")
+        warning = assess(command)
+        if warning:
+            console.print(f"[tg.warn]⚠ This command {warning}.[/]")
+        if not assume_yes:
+            prompt = 'Type "yes" to run it: ' if warning else "Run? [Y/n/s(kip)/q(uit)] "
+            try:
+                answer = input(prompt).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return 130
+            if warning:
+                if answer != "yes":
+                    console.print("[tg.muted]Skipped.[/]")
+                    continue
+            elif answer in ("q", "quit"):
+                return rc
+            elif answer in ("n", "no", "s", "skip"):
+                continue
+            elif answer not in ("", "y", "yes"):
+                continue
+        rc = _cmd_exec(config, command)
+        if rc != 0 and i < total:
+            if assume_yes:
+                console.print(f"[tg.warn]Step {i} failed (exit {rc}); stopping.[/]")
+                return rc
+            try:
+                cont = input(f"Step failed (exit {rc}). Continue? [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return rc
+            if cont not in ("y", "yes"):
+                return rc
+    return rc
+
+
+def _run_confirmed(config: "Config", command: str) -> bool:
+    """Gate risky commands behind a typed confirmation. True = go ahead.
+
+    Safe commands pass straight through — one-keypress speed is the point.
+    Destructive-looking ones (see cli.risk) must be confirmed by typing "yes".
+    """
+    from terminalghost.cli.risk import assess
+    from terminalghost.ui import console_for
+
+    warning = assess(command)
+    if warning is None:
+        return True
+    console = console_for(config)
+    console.print(f"[tg.warn]⚠ This command {warning}.[/]")
+    try:
+        answer = input('Type "yes" to run it: ').strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    if answer != "yes":
+        console.print("[tg.muted]Skipped.[/]")
+        return False
+    return True
 
 
 def _read_key() -> str:
@@ -330,22 +490,57 @@ def _fetch_suggestion(config: "Config") -> str:
     return _request(config, {"type": "suggestion"})
 
 
-def _cmd_apply(config: "Config", assume_yes: bool = False) -> int:
-    """Run the command TerminalGhost last suggested, after confirmation."""
+def _cmd_apply(config: "Config", assume_yes: bool = False,
+               name: str | None = None) -> int:
+    """Run the last suggested fix — or a saved one (`apply <name>`).
+
+    Destructive-looking suggestions (see cli.risk) always show a plain-language
+    warning and, unless --yes was given, need a typed "yes" instead of a
+    one-letter confirmation.
+    """
     from rich.markup import escape
 
+    from terminalghost.cli.risk import assess
     from terminalghost.ui import console_for
 
     console = console_for(config)
-    command = _fetch_suggestion(config)
-    if not command:
+    if name:
+        from terminalghost.cli.fixes import load_fix_commands
+
+        commands = load_fix_commands(config, name) or []
+        if not commands:
+            console.print(
+                f"[tg.error]No saved fix named {escape(name)!s}.[/] "
+                "See [tg.key]terminalghost fixes[/]."
+            )
+            return 1
+        console.print(f"[tg.header]Saved fix [tg.key]{escape(name)}[/]:[/]")
+    else:
+        commands = _suggested_commands(config)
+    if not commands:
         console.print(
             "[tg.muted]Nothing to apply yet — ask a [tg.key]??[/] first "
             "(works best with [tg.key]?? fix[/]).[/]"
         )
         return 0
 
+    if len(commands) > 1:
+        console.print(f"[tg.header]Suggested plan ({len(commands)} steps):[/]")
+        for i, step in enumerate(commands, start=1):
+            console.print(f"  [tg.muted]{i}.[/] [tg.cmd]{escape(step)}[/]")
+        if not assume_yes and not sys.stdin.isatty():
+            console.print(
+                "[tg.warn]Refusing to run without confirmation.[/] "
+                "Re-run with [tg.key]--yes[/]."
+            )
+            return 1
+        return _run_steps(config, commands, assume_yes=assume_yes)
+
+    command = commands[0]
     console.print(f"[tg.header]Suggested:[/] [tg.cmd]{escape(command)}[/]")
+    warning = assess(command)
+    if warning:
+        console.print(f"[tg.warn]⚠ This command {warning}.[/]")
     if not assume_yes:
         if not sys.stdin.isatty():
             console.print(
@@ -353,12 +548,14 @@ def _cmd_apply(config: "Config", assume_yes: bool = False) -> int:
                 "Re-run with [tg.key]--yes[/]."
             )
             return 1
+        prompt = 'Type "yes" to run it: ' if warning else "Run it? [y/N] "
         try:
-            answer = input("Run it? [y/N] ").strip().lower()
+            answer = input(prompt).strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             return 130
-        if answer not in ("y", "yes"):
+        accepted = ("yes",) if warning else ("y", "yes")
+        if answer not in accepted:
             console.print("[tg.muted]Skipped.[/]")
             return 0
     # The suggestion is already a shell-ready command line; run it as-is.

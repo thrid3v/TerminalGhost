@@ -110,6 +110,66 @@ def test_get_last_error_returns_most_recent_failure(db):
     assert error.cmd == "fail-2"
 
 
+# -- history filters -----------------------------------------------------------------
+
+
+def _insert_filter_fixture(db):
+    now = time.time()
+    db.insert_command(CommandEvent(
+        session_id=1, ts=now - 7200, cwd="/proj-a", cmd="docker build .",
+        exit_code=1, duration_ms=10,
+    ))
+    db.insert_command(CommandEvent(
+        session_id=1, ts=now - 60, cwd="/proj-b", cmd="docker run app",
+        exit_code=0, duration_ms=10,
+    ))
+    db.insert_command(CommandEvent(
+        session_id=1, ts=now - 30, cwd="/proj-a", cmd="make test",
+        exit_code=2, duration_ms=10,
+    ))
+    return now
+
+
+def test_filter_failed_only(db):
+    _insert_filter_fixture(db)
+    failed = db.get_recent_commands(failed_only=True)
+    assert [e.cmd for e in failed] == ["make test", "docker build ."]
+
+
+def test_filter_by_cwd(db):
+    _insert_filter_fixture(db)
+    in_a = db.get_recent_commands(cwd="/proj-a")
+    assert [e.cmd for e in in_a] == ["make test", "docker build ."]
+    assert db.get_recent_commands(cwd="/nowhere") == []
+
+
+def test_filter_since(db):
+    now = _insert_filter_fixture(db)
+    recent = db.get_recent_commands(since=now - 120)
+    assert [e.cmd for e in recent] == ["make test", "docker run app"]
+
+
+def test_filter_grep_case_insensitive_substring(db):
+    _insert_filter_fixture(db)
+    hits = db.get_recent_commands(grep="DOCKER")
+    assert [e.cmd for e in hits] == ["docker run app", "docker build ."]
+
+
+def test_filter_grep_escapes_like_wildcards(db):
+    db.insert_command(make_event(cmd="echo 100%"))
+    db.insert_command(make_event(cmd="echo hundred"))
+    hits = db.get_recent_commands(grep="100%")
+    assert [e.cmd for e in hits] == ["echo 100%"]
+    # a bare % must not act as match-everything
+    assert db.get_recent_commands(grep="%hundred%") == []
+
+
+def test_filters_combine(db):
+    _insert_filter_fixture(db)
+    hits = db.get_recent_commands(failed_only=True, cwd="/proj-a", grep="docker")
+    assert [e.cmd for e in hits] == ["docker build ."]
+
+
 # -- clear ---------------------------------------------------------------------------
 
 
@@ -193,35 +253,108 @@ def test_start_and_end_session(db):
     assert row[0] is not None
 
 
+# -- saved fixes -----------------------------------------------------------------------
+
+
+def test_save_and_get_fix(db):
+    db.save_fix("jest-cache", ["npx jest --clearCache", "npm test"],
+                note="jest cache corruption", cwd="/proj")
+    fix = db.get_fix("jest-cache")
+    assert fix.commands == ["npx jest --clearCache", "npm test"]
+    assert fix.note == "jest cache corruption"
+    assert fix.cwd == "/proj"
+    assert fix.created_ts > 0
+    assert fix.last_used_ts is None
+
+
+def test_save_fix_overwrites(db):
+    db.save_fix("f", ["old command"])
+    db.save_fix("f", ["new command"])
+    assert db.get_fix("f").commands == ["new command"]
+    assert len(db.list_fixes()) == 1
+
+
+def test_save_fix_validates(db):
+    with pytest.raises(ValueError):
+        db.save_fix("", ["cmd"])
+    with pytest.raises(ValueError):
+        db.save_fix("name", ["  ", ""])
+
+
+def test_list_fixes_grep_and_order(db):
+    db.save_fix("alpha", ["docker compose up"])
+    db.save_fix("beta", ["make build"])
+    db.touch_fix("alpha")  # most recently used first
+    names = [f.name for f in db.list_fixes()]
+    assert names[0] == "alpha"
+    hits = db.list_fixes(grep="docker")
+    assert [f.name for f in hits] == ["alpha"]
+
+
+def test_delete_fix(db):
+    db.save_fix("gone", ["true"])
+    assert db.delete_fix("gone") is True
+    assert db.delete_fix("gone") is False
+    assert db.get_fix("gone") is None
+
+
+def test_get_fix_missing(db):
+    assert db.get_fix("nope") is None
+
+
 # -- migrations ----------------------------------------------------------------------------
 
 
-def test_migration_applies_and_preserves_content(tmp_path, monkeypatch):
-    path = str(tmp_path / "history.db")
-
-    # create a v1 database with one row
+def _make_v1_db(path, monkeypatch):
+    """Create a database stamped at schema version 1 (pre-fixes)."""
+    monkeypatch.setattr(schema, "SCHEMA_VERSION", 1)
+    monkeypatch.setattr(schema, "get_migrations", lambda: {})
     db1 = Database(path, history_size=10)
     db1.open()
     db1.start_session(shell_pid=1, shell="test")
     db1.insert_command(make_event(cmd="before-migration"))
     db1.close()
+    monkeypatch.undo()
 
-    # pretend the code moved to schema v2 with one ALTER migration
-    monkeypatch.setattr(schema, "SCHEMA_VERSION", 2)
+
+def test_migration_applies_and_preserves_content(tmp_path, monkeypatch):
+    path = str(tmp_path / "history.db")
+    _make_v1_db(path, monkeypatch)
+
+    # pretend the code moved one further, to v3, with an ALTER migration
+    monkeypatch.setattr(schema, "SCHEMA_VERSION", 3)
+    real = schema.get_migrations()
     monkeypatch.setattr(
         schema,
         "get_migrations",
-        lambda: {2: ["ALTER TABLE commands ADD COLUMN tag TEXT"]},
+        lambda: {**real, 3: ["ALTER TABLE commands ADD COLUMN tag TEXT"]},
     )
 
     db2 = Database(path, history_size=10)
     db2.open()
     try:
         conn = db2._require_conn()
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 2
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 3
         columns = [r[1] for r in conn.execute("PRAGMA table_info(commands)")]
         assert "tag" in columns
         # content preserved
+        assert db2.get_recent_commands()[0].cmd == "before-migration"
+    finally:
+        db2.close()
+
+
+def test_v1_database_gains_fixes_table(tmp_path, monkeypatch):
+    """The real v1 → v2 upgrade: an old DB gets the fixes table."""
+    path = str(tmp_path / "history.db")
+    _make_v1_db(path, monkeypatch)
+
+    db2 = Database(path, history_size=10)
+    db2.open()
+    try:
+        conn = db2._require_conn()
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 2
+        db2.save_fix("hello", ["echo hi"])  # table exists and works
+        assert db2.get_fix("hello").commands == ["echo hi"]
         assert db2.get_recent_commands()[0].cmd == "before-migration"
     finally:
         db2.close()

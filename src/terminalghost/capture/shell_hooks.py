@@ -43,6 +43,8 @@ OnHint = Callable[[str, Callable[[str], Awaitable[None]]], Awaitable[None]]
 OnSuggestion = Callable[[Callable[[str], Awaitable[None]]], Awaitable[None]]
 # on_reload(send) — hot-reload config (model hot-switch), then confirm
 OnReload = Callable[[Callable[[str], Awaitable[None]]], Awaitable[None]]
+# on_recap(since, send) — stream a session summary of commands newer than `since`
+OnRecap = Callable[[float, Callable[[str], Awaitable[None]]], Awaitable[None]]
 
 
 class HookReceiver:
@@ -57,6 +59,7 @@ class HookReceiver:
         on_hint: OnHint | None = None,
         on_suggestion: OnSuggestion | None = None,
         on_reload: OnReload | None = None,
+        on_recap: OnRecap | None = None,
         auth_token: str = "",
     ) -> None:
         self._host = host
@@ -66,6 +69,7 @@ class HookReceiver:
         self._on_hint = on_hint
         self._on_suggestion = on_suggestion
         self._on_reload = on_reload
+        self._on_recap = on_recap
         # When set, every payload must carry a matching "token"; this stops other
         # local users on a shared host from reading/posting to the daemon.
         self._auth_token = auth_token
@@ -149,6 +153,9 @@ class HookReceiver:
                 if obj.get("type") == "reload":
                     await self._handle_reload(writer)
                     break
+                if obj.get("type") == "recap":
+                    await self._handle_recap(obj, writer)
+                    break
                 try:
                     event, shell_pid, shell = self._parse_payload(obj)
                 except ValueError as exc:
@@ -228,6 +235,24 @@ class HookReceiver:
             await self._on_reload(send)
         except ConnectionError:
             log.info("reload client disconnected")
+
+    async def _handle_recap(self, obj: dict, writer: asyncio.StreamWriter) -> None:
+        """Stream a session summary back to the client."""
+        if self._on_recap is None:
+            return
+        since = obj.get("since")
+        if isinstance(since, bool) or not isinstance(since, (int, float)) or since <= 0:
+            log.warning("invalid recap payload: %r", obj)
+            return
+
+        async def send(text: str) -> None:
+            writer.write(text.encode("utf-8", errors="replace"))
+            await writer.drain()
+
+        try:
+            await self._on_recap(float(since), send)
+        except ConnectionError:
+            log.info("recap client disconnected mid-response")
 
     # -- payload parsing -----------------------------------------------------------
 

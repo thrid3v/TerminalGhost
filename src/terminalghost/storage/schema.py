@@ -4,7 +4,7 @@
 # connection is opened here — this module is pure SQL strings consumed
 # by db.py.
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 CREATE_VERSION_TABLE = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -35,6 +35,21 @@ CREATE TABLE IF NOT EXISTS commands (
 )
 """
 
+# v2: the saved-fixes library (`terminalghost save` / `apply <name>`).
+# `commands` is the newline-joined plan (commands are extracted per-line, so
+# none can contain a newline).
+CREATE_FIXES_TABLE = """
+CREATE TABLE IF NOT EXISTS fixes (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT    NOT NULL UNIQUE,
+    commands     TEXT    NOT NULL,
+    note         TEXT    NOT NULL DEFAULT '',
+    cwd          TEXT    NOT NULL DEFAULT '',
+    created_ts   REAL    NOT NULL,
+    last_used_ts REAL
+)
+"""
+
 INDEXES = [
     # get_recent_commands / _prune order by id (monotonic), but ts is indexed
     # for any time-window queries; exit_code is indexed for get_last_error.
@@ -46,8 +61,9 @@ INDEXES = [
 def get_migrations() -> dict[int, list[str]]:
     """Map schema version N to the SQL that migrates from N-1 to N.
 
-    Version 1 is the initial schema (created via the CREATE statements above),
-    so there are no migrations yet. Example for a future version 2:
-        {2: ["ALTER TABLE commands ADD COLUMN tag TEXT"]}
+    All statements must be idempotent-safe for fresh databases too (fresh DBs
+    are created directly at SCHEMA_VERSION via the CREATE statements above).
     """
-    return {}
+    return {
+        2: [CREATE_FIXES_TABLE],
+    }

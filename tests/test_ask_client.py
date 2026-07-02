@@ -113,6 +113,54 @@ def test_read_input_from_file(tmp_path):
     assert "missing semicolon" in client._read_input(str(f))
 
 
+class _TTYOut:
+    def __init__(self):
+        self.written = ""
+
+    def isatty(self):
+        return True
+
+    def write(self, text):
+        self.written += text
+
+    def flush(self):
+        pass
+
+
+def _notify_cfg(threshold):
+    cfg = Config()
+    return dataclasses.replace(
+        cfg, ui=dataclasses.replace(cfg.ui, notify_after_seconds=threshold)
+    )
+
+
+def test_notify_done_rings_bell_when_slow(monkeypatch):
+    out = _TTYOut()
+    pinged = []
+    monkeypatch.setattr(client.sys, "stdout", out)
+    monkeypatch.setattr(client, "_native_notify", lambda t, b: pinged.append(b))
+    client._notify_done(_notify_cfg(threshold=10), elapsed=42.0)
+    assert "\a" in out.written
+    assert pinged and "42" in pinged[0]
+
+
+def test_notify_done_quiet_when_fast(monkeypatch):
+    out = _TTYOut()
+    monkeypatch.setattr(client.sys, "stdout", out)
+    monkeypatch.setattr(
+        client, "_native_notify", lambda t, b: (_ for _ in ()).throw(AssertionError)
+    )
+    client._notify_done(_notify_cfg(threshold=10), elapsed=3.0)
+    assert out.written == ""
+
+
+def test_notify_done_disabled_at_zero(monkeypatch):
+    out = _TTYOut()
+    monkeypatch.setattr(client.sys, "stdout", out)
+    client._notify_done(_notify_cfg(threshold=0), elapsed=999.0)
+    assert out.written == ""
+
+
 def test_render_answer_rich_handles_empty_response():
     sock = FakeSocket([b""])
     console = get_console(color="always", record=True)

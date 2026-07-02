@@ -60,8 +60,8 @@ class TriggerHandler:
         self._lock = asyncio.Lock()
         # Last (monotonic_ts, question, answer) for short conversational follow-ups.
         self._last_exchange: tuple[float, str, str] | None = None
-        # Last (monotonic_ts, command) extracted from an answer, for `apply`.
-        self._last_suggestion: tuple[float, str] | None = None
+        # Last (monotonic_ts, commands) plan extracted from an answer, for `apply`.
+        self._last_suggestion: tuple[float, list[str]] | None = None
 
     _INTENTS = ("fix", "explain")
     _MAX_STORED_ANSWER = 2000
@@ -167,6 +167,26 @@ class TriggerHandler:
             except LLMError:
                 pass  # hints are best-effort; never disrupt the prompt
 
+    async def recap(self, since: float, send: SendFn) -> None:
+        """Stream a session summary of commands captured after `since`."""
+        prompt = self._assembler.assemble_recap(since)
+        if prompt is None:
+            await send("Nothing captured in that window yet — run some commands first.\n")
+            return
+        loop = asyncio.get_running_loop()
+        available = await loop.run_in_executor(None, self._backend.is_available)
+        if not available:
+            await send(
+                "TerminalGhost: the LLM backend is not available."
+                " Check that it is running/configured (see config.toml).\n"
+            )
+            return
+        async with self._lock:
+            try:
+                await self._stream_to(self._backend.stream_query(prompt), send)
+            except LLMError as exc:
+                await send(f"\nTerminalGhost error: {exc}\n")
+
     # -- conversational follow-ups ---------------------------------------------
 
     _EMPTY_TIP = (
@@ -218,15 +238,19 @@ class TriggerHandler:
 
     # -- apply-the-fix ---------------------------------------------------------
 
-    @classmethod
-    def _extract_command(cls, answer: str) -> str | None:
-        """Pull the first runnable command out of an answer.
+    _MAX_STEPS = 10  # cap on extracted plan steps
 
-        Prefers a fenced code block (the first non-comment line), falling back
-        to the first inline-code span. Returns None if neither is present.
+    @classmethod
+    def _extract_commands(cls, answer: str) -> list[str]:
+        """Pull the runnable command(s) out of an answer, in order.
+
+        Real fixes are often several commands; the first fenced code block is
+        treated as a plan (every non-comment line a step, capped). Falls back
+        to "$ command" prose lines, then to the first inline-code span.
         """
         fence = cls._FENCE_RE.search(answer)
         if fence:
+            commands: list[str] = []
             for line in fence.group(1).splitlines():
                 stripped = line.strip()
                 # Strip only a "$ " prompt marker — a bare leading "$" may be
@@ -234,30 +258,50 @@ class TriggerHandler:
                 if stripped.startswith("$ "):
                     stripped = stripped[2:].strip()
                 if stripped and not stripped.startswith("#"):
-                    return stripped
-        # A "$ command" prompt line in prose (common when the model skips fences).
+                    commands.append(stripped)
+                if len(commands) >= cls._MAX_STEPS:
+                    break
+            if commands:
+                return commands
+        # "$ command" prompt lines in prose (common when the model skips fences).
+        prose = []
         for line in answer.splitlines():
             stripped = line.strip()
             if stripped.startswith("$ "):
-                return stripped[2:].strip()
+                prose.append(stripped[2:].strip())
+            if len(prose) >= cls._MAX_STEPS:
+                break
+        if prose:
+            return prose
         inline = cls._INLINE_RE.search(answer)
         if inline:
-            return inline.group(1).strip()
-        return None
+            return [inline.group(1).strip()]
+        return []
+
+    @classmethod
+    def _extract_command(cls, answer: str) -> str | None:
+        """The first runnable command in an answer (None if there is none)."""
+        commands = cls._extract_commands(answer)
+        return commands[0] if commands else None
 
     def _record_suggestion(self, answer: str) -> None:
-        command = self._extract_command(answer)
-        if command:
-            self._last_suggestion = (time.monotonic(), command)
+        commands = self._extract_commands(answer)
+        if commands:
+            self._last_suggestion = (time.monotonic(), commands)
+
+    def last_suggestions(self) -> list[str]:
+        """The most recent suggested plan (possibly one step), if still fresh."""
+        if self._last_suggestion is None:
+            return []
+        ts, commands = self._last_suggestion
+        if time.monotonic() - ts > self._SUGGESTION_TTL:
+            return []
+        return list(commands) if isinstance(commands, list) else [commands]
 
     def last_suggestion(self) -> str | None:
-        """The most recent suggested command, if still fresh."""
-        if self._last_suggestion is None:
-            return None
-        ts, command = self._last_suggestion
-        if time.monotonic() - ts > self._SUGGESTION_TTL:
-            return None
-        return command
+        """The first command of the most recent suggestion (back-compat)."""
+        commands = self.last_suggestions()
+        return commands[0] if commands else None
 
     async def _stream_to(self, stream: AsyncIterator[str], emit: SendFn) -> None:
         """Consume the LLM stream, leaving the output clean on interrupt."""

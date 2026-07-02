@@ -33,9 +33,11 @@ class FakeBackend(LLMBackend):
 
 
 class FakeAssembler:
-    def __init__(self):
+    def __init__(self, recap_prompt="RECAP-PROMPT"):
         self.calls: list[tuple[str, str]] = []
         self.last_kwargs: dict = {}
+        self.recap_prompt = recap_prompt
+        self.recap_since: float | None = None
 
     def assemble(self, cwd, inline_context="", *, intent="default", prior_exchange=None,
                  pasted=None):
@@ -43,6 +45,10 @@ class FakeAssembler:
         self.last_kwargs = {"intent": intent, "prior_exchange": prior_exchange,
                             "pasted": pasted}
         return f"PROMPT[{cwd}|{inline_context}]"
+
+    def assemble_recap(self, since):
+        self.recap_since = since
+        return self.recap_prompt
 
 
 @pytest.fixture
@@ -297,3 +303,35 @@ async def test_rapid_triggers_serialized(handler):
     assert "hello world" in "".join(out1)
     assert "hello world" in "".join(out2)
     assert backend.stream_calls == 2
+
+
+# -- recap --------------------------------------------------------------------
+
+
+async def test_recap_streams_summary(handler):
+    h, backend, assembler = handler
+    out, send = collect_sink()
+    await h.recap(1000.0, send)
+    assert "hello world" in "".join(out)
+    assert assembler.recap_since == 1000.0
+    assert backend.prompts == ["RECAP-PROMPT"]
+
+
+async def test_recap_empty_window_says_so():
+    assembler = FakeAssembler(recap_prompt=None)
+    backend = FakeBackend()
+    h = TriggerHandler(db=None, assembler=assembler, backend=backend, config=Config())
+    out, send = collect_sink()
+    await h.recap(1000.0, send)
+    assert "Nothing captured" in "".join(out)
+    assert backend.stream_calls == 0
+
+
+async def test_recap_backend_unavailable():
+    h = TriggerHandler(
+        db=None, assembler=FakeAssembler(), backend=FakeBackend(available=False),
+        config=Config(),
+    )
+    out, send = collect_sink()
+    await h.recap(1000.0, send)
+    assert "not available" in "".join(out)

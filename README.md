@@ -69,12 +69,24 @@ When the answer suggests a command, run it without retyping:
 
 ```
 tga                 # shows the suggested command, asks y/N, then runs it (also captured)
+tgs jest-cache      # a fix worked? save it under a name...
+tga jest-cache      # ...and replay it anytime, in any session
+terminalghost fixes # your saved runbook (--grep to search)
 ```
 
 `tgr` = `terminalghost exec`, `tga` = `terminalghost apply`. The applied command
 runs through the same capture path, so you can immediately `qq` again if it fails.
 (For zero-effort ambient capture on Linux/macOS, see the experimental
 `TG_CAPTURE_OUTPUT` option below.)
+
+**Destructive suggestions are gated.** If the suggested command looks dangerous
+(`rm -rf`, `git push --force`, `git reset --hard`, `dd`, piping a download into a
+shell, `DROP TABLE`, …), TerminalGhost shows a plain-language warning of what it
+would do and requires you to type `yes` — a single keypress or `y` won't run it.
+
+**Multi-step fixes are steppable.** When the answer is a sequence of commands,
+`tga` shows the numbered plan and steps through it — confirm, skip, or quit at
+each step; a failing step stops the plan unless you explicitly continue.
 
 ## Commands
 
@@ -86,13 +98,21 @@ terminalghost stop        # stop it
 terminalghost status      # running / stopped
 terminalghost restart
 terminalghost log [-n N]  # show recently captured commands
+                          #   filter: --failed, --cwd [DIR], --since 2h, --grep <text>
+terminalghost clear       # forget captured history (--last N for just the newest N)
+terminalghost export      # dump history as JSON (pipe or -o FILE) to move machines
+terminalghost import <f>  # load an exported snapshot into this machine's history
+terminalghost redact-check <cmd>  # preview what would be stored — nothing is saved
 terminalghost enable      # start the daemon automatically at login
 terminalghost disable     # undo enable
 terminalghost uninstall   # remove the shell hook block from your profile
 terminalghost exec <cmd>  # run a command, capturing its output for ?? (alias: tgr)
-terminalghost apply       # run the command ?? last suggested (alias: tga)
+terminalghost apply [n]   # run the last suggested fix, or saved fix n (alias: tga)
+terminalghost save <n>    # save the last suggested fix under a name (alias: tgs)
+terminalghost fixes       # list saved fixes; --grep to search, --delete to remove
 terminalghost dashboard   # full-screen view: status, recent commands, output
 terminalghost explain     # explain piped output / a file: make 2>&1 | tg explain
+terminalghost recap       # summarize the session (--since 8h): great for standups
 terminalghost cheatsheet  # everything you can do, at a glance
 terminalghost use <b>     # switch LLM: use ollama:mistral | use claude | use openai
 terminalghost theme <t>   # dark | light | high-contrast
@@ -128,13 +148,22 @@ Highlights:
   (or `terminalghost theme <name>`), `markdown` = render answers as live markdown.
 - `[general] port = 0` picks a free port automatically.
 - `[llm] followup_seconds` controls the conversational follow-up window.
+- `[context] project_context` (default on) folds project facts into every `??`:
+  git branch + dirty state, and key dependencies from `package.json`,
+  `pyproject.toml`, `requirements.txt`, `Cargo.toml`, or `go.mod` — so "why does
+  this fail" answers know your versions without you pasting them.
+- `[ui] notify_after_seconds` (default 20) rings the terminal bell — plus a
+  desktop notification on macOS/Linux — when a slow answer finishes, so you can
+  tab away from a big local model. Set 0 to disable.
 
-## Output capture (experimental, opt-in, POSIX)
+## Output capture (experimental, opt-in)
 
 By default TerminalGhost sees your commands and exit codes but **not** their output.
 To let it read the actual error text, set `capture.capture_output = true` and export
 `TG_CAPTURE_OUTPUT=1` before the hooks load. The bash/zsh hooks then run your shell inside
-`script` to transcribe output. It's off by default and POSIX-only (Windows needs ConPTY).
+`script` to transcribe output; the PowerShell hook uses `Start-Transcript` the same way.
+Caveat: Windows PowerShell 5.1 transcripts miss most native `.exe` output (PowerShell 7+
+captures it) — `tgr <cmd>` remains the guaranteed capture path everywhere.
 
 ## Proactive hints (experimental, opt-in)
 
@@ -151,6 +180,27 @@ sends assembled context to that provider — your choice, off by default.
 To make TerminalGhost forget what it captured, run **`terminalghost clear`** (everything)
 or `terminalghost clear --last N` (just the last N commands — handy right after typing
 a secret). The database is vacuumed so deleted text actually leaves the file.
+
+Don't take redaction on faith — check it: **`terminalghost redact-check "export TOKEN=abc123"`**
+shows exactly what would be stored for any command, without saving anything. Rows where
+redaction fired are highlighted in `terminalghost log`, and history snapshots
+(`export`/`import`) only ever contain the already-redacted text.
+
+**Per-project privacy.** Drop a `.terminalghost.toml` in a sensitive repo to tighten
+settings just there:
+
+```toml
+[capture]
+capture_output = false            # never store output from this project
+redact_passwords = true           # force redaction on
+blocked_commands = ["kubectl"]    # extra never-store patterns (additive)
+
+[context]
+project_context = false           # keep manifests/git state out of prompts
+```
+
+Project files travel with repos you clone, so **only stricter settings are honored** —
+a repo can never switch your LLM backend, redirect `base_url`, or turn redaction off.
 
 ## Development
 

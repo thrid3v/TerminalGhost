@@ -29,6 +29,7 @@ import psutil
 
 from terminalghost.capture.shell_hooks import HookReceiver
 from terminalghost.config.loader import Config, ConfigError, load_config
+from terminalghost.config.project import load_project_overrides
 from terminalghost.context.assembler import ContextAssembler
 from terminalghost.llm.base import get_backend
 from terminalghost.runtime import (
@@ -86,6 +87,7 @@ class Daemon:
                 on_hint=self._on_hint,
                 on_suggestion=self._on_suggestion,
                 on_reload=self._on_reload,
+                on_recap=self._on_recap,
                 auth_token=auth_token,
             )
             await receiver.start()
@@ -121,20 +123,26 @@ class Daemon:
         assert self._db is not None
         event.session_id = self._session_for(shell_pid, shell)
         cap = self._config.capture
+        # Repo-local .terminalghost.toml can only tighten these settings.
+        proj = load_project_overrides(event.cwd)
         # Output: privacy gate first. Ambient hook output needs capture_output;
-        # explicit `terminalghost exec` (source="run") is always kept. Blocked
-        # commands never store output regardless.
-        keep_output = (cap.capture_output or event.source == "run") and not self._is_blocked(
-            event.cmd
+        # explicit `terminalghost exec` (source="run") is normally kept, but a
+        # project-level opt-out silences even that (the repo is sensitive).
+        # Blocked commands never store output regardless.
+        keep_output = (
+            (cap.capture_output or event.source == "run")
+            and not proj.capture_output_off
+            and not self._is_blocked(event.cmd, proj.extra_blocked)
         )
+        redact = cap.redact_passwords or proj.redact_passwords_on
         if not keep_output:
             event.output = None
         elif event.output:
             event.output = _trim_output(event.output, cap.output_max_lines)
-            if cap.redact_passwords:
+            if redact:
                 event.output = _redact_output(event.output)
         # Redact secrets that live in the command text itself (tokens, creds-in-URLs).
-        if cap.redact_passwords:
+        if redact:
             event.cmd = _redact_command(event.cmd)
         self._db.insert_command(event)
 
@@ -144,7 +152,10 @@ class Daemon:
         # Redact the stored copy like any other command (`?? my TOKEN=... fails`);
         # the live query keeps the original text — the user typed it for the LLM.
         stored_cmd = cmd
-        if self._config.capture.redact_passwords:
+        if (
+            self._config.capture.redact_passwords
+            or load_project_overrides(cwd).redact_passwords_on
+        ):
             stored_cmd = _redact_command(cmd)
         self._db.insert_command(
             CommandEvent(
@@ -164,16 +175,25 @@ class Daemon:
         await self._trigger.hint(cwd, send)
 
     async def _on_suggestion(self, send) -> None:
-        """Write back the last command TerminalGhost suggested (for `apply`)."""
+        """Write back the last suggested plan, one command per line (for `apply`).
+
+        Commands are extracted per-line so none can contain a newline; the
+        newline-joined wire format is unambiguous.
+        """
         assert self._trigger is not None
-        command = self._trigger.last_suggestion()
-        if command:
-            await send(command)
+        commands = self._trigger.last_suggestions()
+        if commands:
+            await send("\n".join(commands))
 
     async def _on_reload(self, send) -> None:
         """Hot-reload config (used by `terminalghost use` to switch backends)."""
         self._reload_config()
         await send("ok")
+
+    async def _on_recap(self, since: float, send) -> None:
+        """Stream a session summary (what broke, what fixed it)."""
+        assert self._trigger is not None
+        await self._trigger.recap(since, send)
 
     def _session_for(self, shell_pid: int | None, shell: str | None) -> int:
         assert self._db is not None
@@ -187,8 +207,8 @@ class Daemon:
             )
         return self._sessions[shell_pid]
 
-    def _is_blocked(self, cmd: str) -> bool:
-        for pattern in self._config.capture.blocked_commands:
+    def _is_blocked(self, cmd: str, extra: tuple[str, ...] = ()) -> bool:
+        for pattern in (*self._config.capture.blocked_commands, *extra):
             try:
                 if re.search(pattern, cmd):
                     return True
@@ -340,6 +360,37 @@ def _redact_output(output: str) -> str:
     return _redact_secrets("\n".join(redacted))
 
 
+def _cmd_redact_check(config: Config, text: str) -> int:
+    """Dry-run the storage redaction on `text` and show the result.
+
+    Turns the redaction feature into something users can verify ("what would
+    TerminalGhost keep if I typed this?") instead of a black box. Nothing is
+    stored or sent anywhere.
+    """
+    from rich.markup import escape
+
+    from terminalghost.ui import console_for
+
+    console = console_for(config)
+    if not config.capture.redact_passwords:
+        console.print(
+            "[tg.warn]![/] capture.redact_passwords is disabled — commands are "
+            "stored verbatim. Enable it in config.toml to redact secrets."
+        )
+        return 1
+    redacted = _redact_command(text)
+    if redacted == text:
+        console.print("[tg.success]✓[/] No secrets detected; this would be stored as-is:")
+        console.print(f"  [tg.cmd]{escape(text)}[/]")
+    else:
+        highlighted = escape(redacted).replace(
+            "<redacted>", "[tg.warn]<redacted>[/tg.warn]"
+        )
+        console.print("[tg.warn]![/] Secrets detected — this would be stored as:")
+        console.print(f"  [tg.cmd]{highlighted}[/]")
+    return 0
+
+
 # -- CLI ------------------------------------------------------------------------------
 
 
@@ -382,21 +433,60 @@ def main() -> None:
     )
     exec_p.add_argument("cmd", nargs=argparse.REMAINDER, help="the command to run")
     apply_p = sub.add_parser(
-        "apply", help="run the command TerminalGhost last suggested (alias: tga)"
+        "apply", help="run the last suggested fix, or a saved one (alias: tga)"
     )
+    apply_p.add_argument("name", nargs="?", default=None,
+                         help="a saved fix to run (see: terminalghost fixes)")
     apply_p.add_argument("-y", "--yes", action="store_true",
                          help="run without confirmation")
+    save_p = sub.add_parser(
+        "save", help="save the last suggested fix under a name (alias: tgs)"
+    )
+    save_p.add_argument("name", help="name for the fix, e.g. jest-cache")
+    save_p.add_argument("-n", "--note", default="", help="what this fixes")
+    fixes_p = sub.add_parser("fixes", help="list saved fixes (your personal runbook)")
+    fixes_p.add_argument("--grep", default=None, metavar="TEXT",
+                         help="only fixes whose name/commands contain TEXT")
+    fixes_p.add_argument("--delete", default=None, metavar="NAME",
+                         help="delete the named fix")
 
     sub.add_parser("hint", help="print a one-line proactive hint for the last failure")
+    recap_p = sub.add_parser(
+        "recap", help="summarize this session: what broke, what fixed it"
+    )
+    recap_p.add_argument("--since", default="8h", metavar="AGE",
+                         help="window to summarize (e.g. 90m, 8h, 1d; default 8h)")
     sub.add_parser("init", help="interactive first-time setup wizard")
     sub.add_parser("doctor", help="diagnose the installation and print fixes")
     log_p = sub.add_parser("log", help="show recently captured commands")
     log_p.add_argument("-n", "--limit", type=int, default=20, help="how many to show")
+    log_p.add_argument("--failed", action="store_true",
+                       help="only commands that exited non-zero")
+    log_p.add_argument("--cwd", nargs="?", const=".", default=None, metavar="DIR",
+                       help="only commands run in DIR (bare --cwd = here)")
+    log_p.add_argument("--since", default=None, metavar="AGE",
+                       help="only commands newer than AGE (e.g. 90s, 15m, 2h, 3d)")
+    log_p.add_argument("--grep", default=None, metavar="TEXT",
+                       help="only commands containing TEXT (case-insensitive)")
     clear_p = sub.add_parser("clear", help="delete captured command history")
     clear_p.add_argument("--last", type=int, default=None, metavar="N",
                          help="delete only the N most recent commands")
     clear_p.add_argument("-y", "--yes", action="store_true",
                          help="delete without confirmation")
+    export_p = sub.add_parser(
+        "export", help="dump captured history as JSON (stdout or a file)"
+    )
+    export_p.add_argument("-o", "--out", default=None, metavar="FILE",
+                          help="write to FILE instead of stdout")
+    import_p = sub.add_parser(
+        "import", help="load a history snapshot produced by export"
+    )
+    import_p.add_argument("file", help="snapshot file to import")
+    rc_p = sub.add_parser(
+        "redact-check",
+        help="dry-run: show what would be stored for a command (nothing is saved)",
+    )
+    rc_p.add_argument("text", nargs="+", help="the command to test")
     hp = sub.add_parser("hook-path", help="print the path to a bundled shell hook script")
     hp.add_argument("shell", help="shell name (zsh | bash | powershell)")
     uninst = sub.add_parser("uninstall", help="remove the TerminalGhost block from your shell profile")
@@ -447,6 +537,10 @@ def main() -> None:
         from terminalghost.cli import client
 
         sys.exit(client._cmd_hint(config))
+    elif command == "recap":
+        from terminalghost.cli import client
+
+        sys.exit(client._cmd_recap(config, args.since))
     elif command == "exec":
         from terminalghost.cli import client
 
@@ -454,7 +548,15 @@ def main() -> None:
     elif command == "apply":
         from terminalghost.cli import client
 
-        sys.exit(client._cmd_apply(config, assume_yes=args.yes))
+        sys.exit(client._cmd_apply(config, assume_yes=args.yes, name=args.name))
+    elif command == "save":
+        from terminalghost.cli.fixes import cmd_save
+
+        sys.exit(cmd_save(config, args.name, note=args.note))
+    elif command == "fixes":
+        from terminalghost.cli.fixes import cmd_fixes
+
+        sys.exit(cmd_fixes(config, grep=args.grep, delete=args.delete))
     elif command == "init":
         from terminalghost.cli.init import cmd_init
 
@@ -466,11 +568,22 @@ def main() -> None:
     elif command == "log":
         from terminalghost.cli.logview import cmd_log
 
-        sys.exit(cmd_log(config, args.limit))
+        sys.exit(cmd_log(config, args.limit, failed=args.failed, cwd=args.cwd,
+                         since=args.since, grep=args.grep))
     elif command == "clear":
         from terminalghost.cli.logview import cmd_clear
 
         sys.exit(cmd_clear(config, args.last, args.yes))
+    elif command == "export":
+        from terminalghost.cli.transfer import cmd_export
+
+        sys.exit(cmd_export(config, args.out))
+    elif command == "import":
+        from terminalghost.cli.transfer import cmd_import
+
+        sys.exit(cmd_import(config, args.file))
+    elif command == "redact-check":
+        sys.exit(_cmd_redact_check(config, " ".join(args.text)))
     elif command == "uninstall":
         from terminalghost.cli.init import cmd_uninstall
 
@@ -596,6 +709,9 @@ def _cmd_start(config: Config, config_path: str | None) -> int:
         print(f"daemon failed to start; see {log_path}", file=sys.stderr)
         return 1
     _show_banner(config)
+    from rich.markup import escape
+
+    from terminalghost.cli.tips import random_tip
     from terminalghost.ui import console_for
 
     console = console_for(config)
@@ -604,6 +720,7 @@ def _cmd_start(config: Config, config_path: str | None) -> int:
         f"[tg.success]✓[/] daemon started (pid {real_pid}), listening on "
         f"[tg.key]{config.general.host}:{port}[/]"
     )
+    console.print(f"[tg.muted]tip: {escape(random_tip())}[/]")
     return 0
 
 
