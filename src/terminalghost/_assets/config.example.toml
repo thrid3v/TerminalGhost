@@ -25,6 +25,9 @@ theme = "dark"
 banner = true
 # Render streamed ?? answers as live markdown (vs. plain streamed text).
 markdown = true
+# Ring the terminal bell (+ desktop notification where available) when an
+# answer took longer than this many seconds. 0 disables it.
+notify_after_seconds = 20
 
 [capture]
 # Redact secrets in stored command text (TOKEN=..., --password=..., creds in
@@ -49,6 +52,10 @@ tree_depth = 3
 tree_ignore = [".git", "__pycache__", "node_modules", ".venv"]
 # Approximate token budget for the assembled context sent to the LLM
 token_budget = 3000
+# Fold project facts into the prompt automatically: git branch + dirty state,
+# key dependencies from package.json / pyproject.toml / requirements.txt /
+# Cargo.toml / go.mod.
+project_context = true
 
 [llm]
 # Which backend to use: "ollama" | "claude" | "openai"

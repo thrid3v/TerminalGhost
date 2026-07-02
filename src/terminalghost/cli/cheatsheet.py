@@ -14,6 +14,7 @@ _ROWS = [
     ("tgr <cmd>", "run a command so its output is captured for the next qq"),
     ("tga", "run the command TerminalGhost last suggested"),
     ("cmd | tg explain", "explain piped output or a file"),
+    ("terminalghost recap", "summarize the session: what broke, what fixed it"),
     ("terminalghost dashboard", "full-screen view of captured commands + status"),
     ("terminalghost use <backend>", "switch LLM, e.g. use ollama:mistral or use claude"),
     ("terminalghost theme <name>", "dark | light | high-contrast"),

@@ -146,6 +146,126 @@ def test_estimate_tokens(db):
     assert 80 <= estimate <= 120  # ~100, within 20%
 
 
+# -- recap prompt --------------------------------------------------------------
+
+
+def test_assemble_recap_includes_commands_in_window(db):
+    old = make_event("ancient-cmd")
+    old.ts = time.time() - 9999
+    db.insert_command(old)
+    db.insert_command(make_event("recent-fail", exit_code=1))
+    db.insert_command(make_event("recent-fix"))
+    assembler = ContextAssembler(db, Config())
+    prompt = assembler.assemble_recap(since=time.time() - 3600)
+    assert prompt is not None
+    assert "Summarize this terminal session" in prompt
+    assert "recent-fail" in prompt and "recent-fix" in prompt
+    assert "ancient-cmd" not in prompt
+
+
+def test_assemble_recap_none_when_empty(db):
+    assembler = ContextAssembler(db, Config())
+    assert assembler.assemble_recap(since=time.time() - 3600) is None
+
+
+def test_assemble_recap_respects_budget(db):
+    config = Config()
+    config = dataclasses.replace(
+        config, context=dataclasses.replace(config.context, token_budget=200)
+    )
+    for i in range(60):
+        db.insert_command(make_event(f"recap-cmd-{i:03d} " + "x" * 60))
+    assembler = ContextAssembler(db, config)
+    prompt = assembler.assemble_recap(since=time.time() - 3600)
+    assert assembler._estimate_tokens(prompt) <= 250
+    assert "recap-cmd-059" in prompt  # newest survives
+    assert "recap-cmd-000" not in prompt
+
+
+# -- auto project context -----------------------------------------------------
+
+
+def test_project_context_package_json(db, tmp_path):
+    import json
+
+    (tmp_path / "package.json").write_text(json.dumps({
+        "engines": {"node": ">=20"},
+        "dependencies": {"react": "^18.2.0", "left-pad": "1.0.0"},
+    }), encoding="utf-8")
+    assembler = ContextAssembler(db, Config())
+    prompt = assembler.assemble(str(tmp_path))
+    assert "## Project" in prompt
+    assert "react@^18.2.0" in prompt
+    assert "node" in prompt
+
+
+def test_project_context_pyproject(db, tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "x"\nrequires-python = ">=3.11"\n'
+        'dependencies = ["httpx>=0.27", "rich>=13.7"]\n',
+        encoding="utf-8",
+    )
+    assembler = ContextAssembler(db, Config())
+    prompt = assembler.assemble(str(tmp_path))
+    assert "requires-python >=3.11" in prompt
+    assert "httpx>=0.27" in prompt
+
+
+def test_project_context_requirements_capped(db, tmp_path):
+    reqs = "\n".join(f"pkg{i}==1.0" for i in range(15))
+    (tmp_path / "requirements.txt").write_text(reqs, encoding="utf-8")
+    assembler = ContextAssembler(db, Config())
+    prompt = assembler.assemble(str(tmp_path))
+    assert "pkg0==1.0" in prompt
+    assert "(+3 more)" in prompt
+
+
+def test_project_context_disabled_by_config(db, tmp_path):
+    (tmp_path / "requirements.txt").write_text("flask==3.0\n", encoding="utf-8")
+    config = Config()
+    config = dataclasses.replace(
+        config, context=dataclasses.replace(config.context, project_context=False)
+    )
+    assembler = ContextAssembler(db, config)
+    prompt = assembler.assemble(str(tmp_path))
+    assert "## Project" not in prompt
+
+
+def test_project_context_survives_malformed_manifest(db, tmp_path):
+    (tmp_path / "package.json").write_text("{not json", encoding="utf-8")
+    assembler = ContextAssembler(db, Config())
+    prompt = assembler.assemble(str(tmp_path))  # must not raise
+    assert "Current directory" in prompt
+
+
+def test_git_summary_parses(monkeypatch):
+    from terminalghost.context import assembler as mod
+
+    class FakeResult:
+        def __init__(self, out):
+            self.returncode = 0
+            self.stdout = out
+
+    def fake_run(argv, **kwargs):
+        if "rev-parse" in argv:
+            return FakeResult("feat/thing\n")
+        return FakeResult(" M a.py\n M b.py\n")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    assert mod._git_summary("/repo") == "git: branch feat/thing, 2 changed file(s)"
+
+
+def test_git_summary_none_outside_repo(monkeypatch):
+    from terminalghost.context import assembler as mod
+
+    class FakeResult:
+        returncode = 128
+        stdout = ""
+
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: FakeResult())
+    assert mod._git_summary("/not-a-repo") is None
+
+
 def test_history_format_marks_error_and_orders_oldest_first(db):
     db.insert_command(make_event("first-cmd"))
     db.insert_command(make_event("bad-cmd", exit_code=1))

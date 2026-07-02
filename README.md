@@ -81,6 +81,10 @@ runs through the same capture path, so you can immediately `qq` again if it fail
 shell, `DROP TABLE`, …), TerminalGhost shows a plain-language warning of what it
 would do and requires you to type `yes` — a single keypress or `y` won't run it.
 
+**Multi-step fixes are steppable.** When the answer is a sequence of commands,
+`tga` shows the numbered plan and steps through it — confirm, skip, or quit at
+each step; a failing step stops the plan unless you explicitly continue.
+
 ## Commands
 
 ```
@@ -103,6 +107,7 @@ terminalghost exec <cmd>  # run a command, capturing its output for ?? (alias: t
 terminalghost apply       # run the command ?? last suggested (alias: tga)
 terminalghost dashboard   # full-screen view: status, recent commands, output
 terminalghost explain     # explain piped output / a file: make 2>&1 | tg explain
+terminalghost recap       # summarize the session (--since 8h): great for standups
 terminalghost cheatsheet  # everything you can do, at a glance
 terminalghost use <b>     # switch LLM: use ollama:mistral | use claude | use openai
 terminalghost theme <t>   # dark | light | high-contrast
@@ -138,6 +143,13 @@ Highlights:
   (or `terminalghost theme <name>`), `markdown` = render answers as live markdown.
 - `[general] port = 0` picks a free port automatically.
 - `[llm] followup_seconds` controls the conversational follow-up window.
+- `[context] project_context` (default on) folds project facts into every `??`:
+  git branch + dirty state, and key dependencies from `package.json`,
+  `pyproject.toml`, `requirements.txt`, `Cargo.toml`, or `go.mod` — so "why does
+  this fail" answers know your versions without you pasting them.
+- `[ui] notify_after_seconds` (default 20) rings the terminal bell — plus a
+  desktop notification on macOS/Linux — when a slow answer finishes, so you can
+  tab away from a big local model. Set 0 to disable.
 
 ## Output capture (experimental, opt-in, POSIX)
 

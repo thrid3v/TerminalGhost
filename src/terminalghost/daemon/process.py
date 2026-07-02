@@ -86,6 +86,7 @@ class Daemon:
                 on_hint=self._on_hint,
                 on_suggestion=self._on_suggestion,
                 on_reload=self._on_reload,
+                on_recap=self._on_recap,
                 auth_token=auth_token,
             )
             await receiver.start()
@@ -164,16 +165,25 @@ class Daemon:
         await self._trigger.hint(cwd, send)
 
     async def _on_suggestion(self, send) -> None:
-        """Write back the last command TerminalGhost suggested (for `apply`)."""
+        """Write back the last suggested plan, one command per line (for `apply`).
+
+        Commands are extracted per-line so none can contain a newline; the
+        newline-joined wire format is unambiguous.
+        """
         assert self._trigger is not None
-        command = self._trigger.last_suggestion()
-        if command:
-            await send(command)
+        commands = self._trigger.last_suggestions()
+        if commands:
+            await send("\n".join(commands))
 
     async def _on_reload(self, send) -> None:
         """Hot-reload config (used by `terminalghost use` to switch backends)."""
         self._reload_config()
         await send("ok")
+
+    async def _on_recap(self, since: float, send) -> None:
+        """Stream a session summary (what broke, what fixed it)."""
+        assert self._trigger is not None
+        await self._trigger.recap(since, send)
 
     def _session_for(self, shell_pid: int | None, shell: str | None) -> int:
         assert self._db is not None
@@ -419,6 +429,11 @@ def main() -> None:
                          help="run without confirmation")
 
     sub.add_parser("hint", help="print a one-line proactive hint for the last failure")
+    recap_p = sub.add_parser(
+        "recap", help="summarize this session: what broke, what fixed it"
+    )
+    recap_p.add_argument("--since", default="8h", metavar="AGE",
+                         help="window to summarize (e.g. 90m, 8h, 1d; default 8h)")
     sub.add_parser("init", help="interactive first-time setup wizard")
     sub.add_parser("doctor", help="diagnose the installation and print fixes")
     log_p = sub.add_parser("log", help="show recently captured commands")
@@ -500,6 +515,10 @@ def main() -> None:
         from terminalghost.cli import client
 
         sys.exit(client._cmd_hint(config))
+    elif command == "recap":
+        from terminalghost.cli import client
+
+        sys.exit(client._cmd_recap(config, args.since))
     elif command == "exec":
         from terminalghost.cli import client
 

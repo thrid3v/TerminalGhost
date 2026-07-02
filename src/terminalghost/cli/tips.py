@@ -24,6 +24,8 @@ TIPS: tuple[str, ...] = (
     "export TG_HINTS=1 to get a one-line fix suggestion after every failure",
     "`terminalghost dashboard` is a live full-screen view of your history",
     "themes: terminalghost theme light (or high-contrast)",
+    "`terminalghost recap` writes your standup note: what broke, what fixed it",
+    "multi-command fixes step through one at a time — skip or quit any step",
 )
 
 
