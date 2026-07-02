@@ -70,7 +70,10 @@ def test_import_rejects_non_snapshot(tmp_path, capsys):
     bogus = tmp_path / "bogus.json"
     bogus.write_text(json.dumps({"something": "else"}), encoding="utf-8")
     assert transfer.cmd_import(cfg, str(bogus)) == 1
-    assert "not a terminalghost export" in capsys.readouterr().out
+    # Rich wraps at the console width and tmp-path lengths vary per platform,
+    # so normalize newlines before matching (this bit ubuntu CI).
+    out = capsys.readouterr().out.replace("\n", " ")
+    assert "Not a terminalghost export snapshot" in out
 
 
 def test_import_accepts_utf8_bom(tmp_path, capsys):

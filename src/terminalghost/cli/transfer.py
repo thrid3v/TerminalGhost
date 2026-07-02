@@ -93,8 +93,13 @@ def cmd_import(config, file: str) -> int:
         or snapshot.get("terminalghost_export") != EXPORT_FORMAT
         or not isinstance(snapshot.get("commands"), list)
     ):
+        from rich.markup import escape
+
+        # Phrase first, path second: the path's length varies by platform and
+        # Rich wraps at the console width — leading with the fixed text keeps
+        # the message scannable however long the path is.
         console.print(
-            f"[tg.error]{file} is not a terminalghost export snapshot.[/]"
+            f"[tg.error]Not a terminalghost export snapshot:[/] {escape(file)}"
         )
         return 1
 
