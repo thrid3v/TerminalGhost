@@ -1,11 +1,12 @@
 # terminalghost.cli.logview
 #
-# `terminalghost log` — show the most recent captured commands as a table.
-# Read-only; opens a second SQLite connection (WAL allows concurrent readers
-# while the daemon is running).
+# `terminalghost log` — show the most recent captured commands as a table —
+# and `terminalghost clear` — wipe captured history. Both open a second
+# SQLite connection (WAL allows concurrent access while the daemon runs).
 
 from __future__ import annotations
 
+import sys
 import time
 
 
@@ -62,3 +63,51 @@ def _short_dir(path: str) -> str:
     """Trailing path component(s), enough to recognize without the full path."""
     parts = path.replace("\\", "/").rstrip("/").split("/")
     return "/".join(parts[-2:]) if len(parts) > 1 else (parts[-1] or path)
+
+
+def cmd_clear(config, last: int | None, assume_yes: bool) -> int:
+    """Delete captured command history (all of it, or just the last N).
+
+    A tool that records shell commands needs a one-command "forget" — e.g.
+    right after a secret was typed. VACUUMs so the data leaves the file.
+    """
+    from terminalghost.storage.db import Database
+    from terminalghost.ui import console_for
+
+    console = console_for(config)
+    scope = f"the last {last} command(s)" if last is not None else "ALL captured history"
+    if not assume_yes:
+        if not sys.stdin.isatty():
+            console.print(
+                "[tg.warn]Refusing to clear without confirmation.[/] "
+                "Re-run with [tg.key]--yes[/]."
+            )
+            return 1
+        try:
+            answer = input(f"Delete {scope}? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 130
+        if answer not in ("y", "yes"):
+            console.print("[tg.muted]Nothing deleted.[/]")
+            return 0
+
+    db = Database(
+        config.general.db_path,
+        history_size=config.general.history_size,
+        max_output_bytes=config.capture.max_output_bytes,
+    )
+    try:
+        db.open()
+        deleted = db.clear_commands(last=last)
+    except Exception as exc:  # noqa: BLE001 — friendly message, not a traceback
+        console.print(f"[tg.error]Could not clear history:[/] {exc}")
+        return 1
+    finally:
+        db.close()
+
+    if deleted == 0:
+        console.print("[tg.muted]History was already empty.[/]")
+    else:
+        console.print(f"[tg.success]✓[/] Deleted {deleted} command(s).")
+    return 0

@@ -67,6 +67,34 @@ def test_gather_checks_returns_labeled_checks():
     assert all(isinstance(c, doctor.Check) for c in checks)
 
 
+def test_doctor_reachable_resolves_ephemeral_port(tmp_path):
+    # With general.port == 0 the daemon writes its bound port to a runtime
+    # file; doctor must probe that port, not the literal 0.
+    import socket
+
+    cfg = dataclasses.replace(
+        Config(),
+        general=dataclasses.replace(
+            Config().general,
+            port=0,
+            pid_file=str(tmp_path / "terminalghost.pid"),
+            db_path=str(tmp_path / "history.db"),
+        ),
+    )
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    bound_port = listener.getsockname()[1]
+    (tmp_path / "port").write_text(str(bound_port), encoding="ascii")
+    try:
+        checks = doctor.gather_checks(cfg)
+    finally:
+        listener.close()
+    reachable = next(c for c in checks if c.label == "Daemon reachable")
+    assert reachable.ok is True
+    assert str(bound_port) in reachable.detail
+
+
 # -- logview ----------------------------------------------------------------
 
 
@@ -108,3 +136,85 @@ def test_cmd_log_empty(tmp_path, capsys):
     rc = logview.cmd_log(cfg, 10)
     assert rc == 0
     assert "No commands captured" in capsys.readouterr().out
+
+
+# -- clear ------------------------------------------------------------------
+
+
+def _history_config(tmp_path, n_commands: int) -> Config:
+    db_path = str(tmp_path / "history.db")
+    db = Database(db_path)
+    db.open()
+    sid = db.start_session(123, "zsh")
+    for i in range(n_commands):
+        db.insert_command(
+            CommandEvent(session_id=sid, ts=time.time(), cwd="/proj",
+                         cmd=f"cmd-{i}", exit_code=0, duration_ms=1)
+        )
+    db.close()
+    return dataclasses.replace(
+        Config(),
+        general=dataclasses.replace(Config().general, db_path=db_path),
+        ui=dataclasses.replace(Config().ui, color="never"),
+    )
+
+
+def test_cmd_clear_all_with_yes(tmp_path, capsys):
+    cfg = _history_config(tmp_path, 3)
+    rc = logview.cmd_clear(cfg, last=None, assume_yes=True)
+    assert rc == 0
+    assert "Deleted 3" in capsys.readouterr().out
+    db = Database(cfg.general.db_path)
+    db.open()
+    try:
+        assert db.get_recent_commands() == []
+    finally:
+        db.close()
+
+
+def test_cmd_clear_last_n(tmp_path, capsys):
+    cfg = _history_config(tmp_path, 5)
+    rc = logview.cmd_clear(cfg, last=2, assume_yes=True)
+    assert rc == 0
+    assert "Deleted 2" in capsys.readouterr().out
+    db = Database(cfg.general.db_path)
+    db.open()
+    try:
+        assert [e.cmd for e in db.get_recent_commands()] == ["cmd-2", "cmd-1", "cmd-0"]
+    finally:
+        db.close()
+
+
+def test_cmd_clear_refuses_without_tty(tmp_path, capsys, monkeypatch):
+    cfg = _history_config(tmp_path, 2)
+    monkeypatch.setattr("sys.stdin", type("S", (), {"isatty": lambda self: False})())
+    rc = logview.cmd_clear(cfg, last=None, assume_yes=False)
+    assert rc == 1
+    assert "Refusing" in capsys.readouterr().out
+    db = Database(cfg.general.db_path)
+    db.open()
+    try:
+        assert len(db.get_recent_commands()) == 2  # nothing deleted
+    finally:
+        db.close()
+
+
+def test_cmd_clear_declined(tmp_path, capsys, monkeypatch):
+    cfg = _history_config(tmp_path, 2)
+    monkeypatch.setattr("sys.stdin", type("S", (), {"isatty": lambda self: True})())
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    rc = logview.cmd_clear(cfg, last=None, assume_yes=False)
+    assert rc == 0
+    assert "Nothing deleted" in capsys.readouterr().out
+
+
+def test_cmd_clear_empty(tmp_path, capsys):
+    db_path = str(tmp_path / "empty.db")
+    cfg = dataclasses.replace(
+        Config(),
+        general=dataclasses.replace(Config().general, db_path=db_path),
+        ui=dataclasses.replace(Config().ui, color="never"),
+    )
+    rc = logview.cmd_clear(cfg, last=None, assume_yes=True)
+    assert rc == 0
+    assert "already empty" in capsys.readouterr().out

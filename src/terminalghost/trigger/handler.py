@@ -228,7 +228,11 @@ class TriggerHandler:
         fence = cls._FENCE_RE.search(answer)
         if fence:
             for line in fence.group(1).splitlines():
-                stripped = line.strip().lstrip("$").strip()
+                stripped = line.strip()
+                # Strip only a "$ " prompt marker — a bare leading "$" may be
+                # part of the command itself (e.g. PowerShell `$env:X = ...`).
+                if stripped.startswith("$ "):
+                    stripped = stripped[2:].strip()
                 if stripped and not stripped.startswith("#"):
                     return stripped
         # A "$ command" prompt line in prose (common when the model skips fences).

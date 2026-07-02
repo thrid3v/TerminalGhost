@@ -173,6 +173,31 @@ class Database:
             row = conn.execute(query, params).fetchone()
         return _row_to_event(row) if row else None
 
+    def clear_commands(self, last: int | None = None) -> int:
+        """Delete captured commands and return how many rows were removed.
+
+        With `last` given, only the N most recent commands are deleted (the
+        "I just typed a secret" case); otherwise everything goes. VACUUMs
+        afterwards so the deleted text actually leaves the database file.
+        """
+        conn = self._require_conn()
+        with self._lock:
+            with conn:
+                if last is None:
+                    cursor = conn.execute("DELETE FROM commands")
+                else:
+                    cursor = conn.execute(
+                        "DELETE FROM commands WHERE id IN"
+                        " (SELECT id FROM commands ORDER BY id DESC LIMIT ?)",
+                        (max(0, last),),
+                    )
+                deleted = cursor.rowcount
+            try:
+                conn.execute("VACUUM")
+            except sqlite3.OperationalError:
+                pass  # e.g. another connection holds the file — data is gone anyway
+        return deleted
+
     # -- sessions ------------------------------------------------------------
 
     def start_session(self, shell_pid: int, shell: str) -> int:

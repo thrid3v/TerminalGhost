@@ -503,7 +503,9 @@ def _copy_to_clipboard(text: str, config: "Config") -> None:
             subprocess.run(["pbcopy"], input=data, check=True)
             ok = True
         elif os.name == "nt":
-            subprocess.run(["clip"], input=data, check=True)
+            # clip.exe treats input as the ANSI codepage unless it sees a
+            # UTF-16LE BOM — encode UTF-16 so non-ASCII survives.
+            subprocess.run(["clip"], input=text.encode("utf-16"), check=True)
             ok = True
         else:
             for tool in (

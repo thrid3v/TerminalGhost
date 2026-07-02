@@ -32,6 +32,7 @@ def gather_checks(config) -> list[Check]:
     from terminalghost.cli import profiles
     from terminalghost.cli.init import ollama_status
     from terminalghost.daemon.process import _daemon_pid
+    from terminalghost.runtime import effective_port
 
     checks: list[Check] = []
 
@@ -46,13 +47,15 @@ def gather_checks(config) -> list[Check]:
         )
     )
 
-    # Socket reachable
-    reachable = _port_open(config.general.host, config.general.port)
+    # Socket reachable — resolve the runtime port file when general.port == 0
+    # (ephemeral), same as the ask/hint clients do.
+    port = effective_port(config)
+    reachable = _port_open(config.general.host, port)
     checks.append(
         Check(
             reachable,
             "Daemon reachable",
-            f"{config.general.host}:{config.general.port}",
+            f"{config.general.host}:{port}",
             "" if reachable else "terminalghost start  (or check general.port in config)",
         )
     )

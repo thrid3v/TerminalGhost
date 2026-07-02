@@ -12,11 +12,25 @@
 #      which streams the LLM answer back to this terminal.
 #
 # Configuration (set before dot-sourcing):
-#   $env:TG_HOST — daemon host, default 127.0.0.1
-#   $env:TG_PORT — daemon port, default 48632
+#   $env:TG_HOST  — daemon host, default 127.0.0.1
+#   $env:TG_PORT  — daemon port. When unset, the port the daemon recorded in
+#                   its runtime file (~/.local/share/terminalghost/port) is
+#                   used, so a custom or ephemeral (port = 0) config just
+#                   works; else 48632.
+#   $env:TG_HINTS — set to '1' for a proactive one-line hint after a failure.
 
 if (-not $env:TG_HOST) { $env:TG_HOST = '127.0.0.1' }
-if (-not $env:TG_PORT) { $env:TG_PORT = '48632' }
+
+function global:Get-TerminalGhostPort {
+    # Explicit TG_PORT wins; else the daemon's runtime port file; else 48632.
+    if ($env:TG_PORT) { return [int]$env:TG_PORT }
+    try {
+        $portFile = Join-Path $HOME '.local\share\terminalghost\port'
+        return [int]((Get-Content $portFile -Raw -ErrorAction Stop).Trim())
+    } catch {
+        return 48632
+    }
+}
 
 $global:__TG_LastHistoryId = (Get-History -Count 1).Id
 
@@ -40,7 +54,7 @@ function global:Send-TerminalGhostEvent {
         } | ConvertTo-Json -Compress) + "`n"
 
         $client = New-Object System.Net.Sockets.TcpClient
-        $connect = $client.BeginConnect($env:TG_HOST, [int]$env:TG_PORT, $null, $null)
+        $connect = $client.BeginConnect($env:TG_HOST, (Get-TerminalGhostPort), $null, $null)
         if ($connect.AsyncWaitHandle.WaitOne(200)) {
             $client.EndConnect($connect)
             $bytes = [Text.Encoding]::UTF8.GetBytes($payload)
@@ -66,6 +80,11 @@ function global:prompt {
         }
         $duration = [int]($entry.EndExecutionTime - $entry.StartExecutionTime).TotalMilliseconds
         Send-TerminalGhostEvent -Cmd $entry.CommandLine -ExitCode $exitCode -DurationMs $duration
+        # Opt-in proactive hint after a failure (TG_HINTS=1). Blocks briefly;
+        # the hint client is silent when the daemon/model has nothing to say.
+        if ($env:TG_HINTS -eq '1' -and $exitCode -ne 0) {
+            try { terminalghost hint 2>$null } catch { }
+        }
     }
     & $global:__TG_OriginalPrompt
 }

@@ -141,12 +141,17 @@ class Daemon:
     async def _on_query(self, cmd: str, cwd: str, send, context: str | None = None) -> None:
         """Handle a ?? query: record it, then stream the answer back."""
         assert self._db is not None and self._trigger is not None
+        # Redact the stored copy like any other command (`?? my TOKEN=... fails`);
+        # the live query keeps the original text — the user typed it for the LLM.
+        stored_cmd = cmd
+        if self._config.capture.redact_passwords:
+            stored_cmd = _redact_command(cmd)
         self._db.insert_command(
             CommandEvent(
                 session_id=self._session_for(None, None),
                 ts=time.time(),
                 cwd=cwd,
-                cmd=cmd,
+                cmd=stored_cmd,
                 exit_code=0,
                 duration_ms=0,
             )
@@ -260,9 +265,10 @@ def _is_loopback(host: str) -> bool:
 def _assert_safe_host(host: str) -> None:
     """Refuse to expose the daemon off-machine.
 
-    The loopback socket is unauthenticated by design (local-trust model), so
-    binding a routable address would hand shell history + LLM access to the
-    network. Require an explicit opt-in for that.
+    The socket's auth token only guards against other local users; it travels
+    unencrypted and the runtime files live on this machine, so binding a
+    routable address would hand shell history + LLM access to the network.
+    Require an explicit opt-in for that.
     """
     if _is_loopback(host) or os.environ.get("TG_ALLOW_REMOTE") == "1":
         return
@@ -386,6 +392,11 @@ def main() -> None:
     sub.add_parser("doctor", help="diagnose the installation and print fixes")
     log_p = sub.add_parser("log", help="show recently captured commands")
     log_p.add_argument("-n", "--limit", type=int, default=20, help="how many to show")
+    clear_p = sub.add_parser("clear", help="delete captured command history")
+    clear_p.add_argument("--last", type=int, default=None, metavar="N",
+                         help="delete only the N most recent commands")
+    clear_p.add_argument("-y", "--yes", action="store_true",
+                         help="delete without confirmation")
     hp = sub.add_parser("hook-path", help="print the path to a bundled shell hook script")
     hp.add_argument("shell", help="shell name (zsh | bash | powershell)")
     uninst = sub.add_parser("uninstall", help="remove the TerminalGhost block from your shell profile")
@@ -456,6 +467,10 @@ def main() -> None:
         from terminalghost.cli.logview import cmd_log
 
         sys.exit(cmd_log(config, args.limit))
+    elif command == "clear":
+        from terminalghost.cli.logview import cmd_clear
+
+        sys.exit(cmd_clear(config, args.last, args.yes))
     elif command == "uninstall":
         from terminalghost.cli.init import cmd_uninstall
 
@@ -634,6 +649,9 @@ def _cmd_stop(config: Config) -> int:
         print(f"daemon (pid {pid}) did not exit within 5s", file=sys.stderr)
         return 1
     Daemon._remove_pid_file(config.general.pid_file)
+    # On Windows terminate() is TerminateProcess, so the daemon's own cleanup
+    # never runs — remove the runtime port file here too (idempotent).
+    _remove_port_file(config)
     print("daemon stopped")
     return 0
 

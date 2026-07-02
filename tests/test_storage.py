@@ -110,6 +110,52 @@ def test_get_last_error_returns_most_recent_failure(db):
     assert error.cmd == "fail-2"
 
 
+# -- clear ---------------------------------------------------------------------------
+
+
+def test_clear_commands_all(db):
+    for i in range(5):
+        db.insert_command(make_event(cmd=f"cmd-{i}"))
+    assert db.clear_commands() == 5
+    assert db.get_recent_commands() == []
+
+
+def test_clear_commands_last_n(db):
+    for i in range(5):
+        db.insert_command(make_event(cmd=f"cmd-{i}"))
+    assert db.clear_commands(last=2) == 2
+    remaining = [e.cmd for e in db.get_recent_commands()]
+    assert remaining == ["cmd-2", "cmd-1", "cmd-0"]
+
+
+def test_clear_commands_last_more_than_present(db):
+    db.insert_command(make_event(cmd="only"))
+    assert db.clear_commands(last=10) == 1
+    assert db.get_recent_commands() == []
+
+
+def test_clear_commands_empty(db):
+    assert db.clear_commands() == 0
+    assert db.clear_commands(last=3) == 0
+
+
+def test_clear_commands_shrinks_file(tmp_path):
+    path = str(tmp_path / "history.db")
+    db = Database(path, history_size=200)
+    db.open()
+    db.start_session(shell_pid=1, shell="test")
+    try:
+        for i in range(50):
+            db.insert_command(make_event(cmd="x" * 2000, output="y" * 4000))
+        conn = db._require_conn()
+        before = conn.execute("PRAGMA page_count").fetchone()[0]
+        db.clear_commands()
+        after = conn.execute("PRAGMA page_count").fetchone()[0]
+        assert after < before  # VACUUM reclaimed the deleted pages
+    finally:
+        db.close()
+
+
 # -- rolling buffer -------------------------------------------------------------------
 
 
