@@ -14,14 +14,15 @@
 #
 # Configuration (export before sourcing):
 #   TG_HOST — daemon host, default 127.0.0.1
-#   TG_PORT — daemon port, default 48632
+#   TG_PORT — daemon port. When unset, the port the daemon recorded in its
+#             runtime file (~/.local/share/terminalghost/port) is used, so a
+#             custom or ephemeral (port = 0) config just works; else 48632.
 #
 # Requirements: python3 on PATH (used for robust JSON escaping + the TCP
 # send; avoids a socat/nc dependency), and a running daemon
 # (`terminalghost start`).
 
 export TG_HOST="${TG_HOST:-127.0.0.1}"
-export TG_PORT="${TG_PORT:-48632}"
 
 # --- Optional output capture (EXPERIMENTAL, opt-in) -------------------------
 # When TG_CAPTURE_OUTPUT=1, re-exec this interactive shell inside `script` so
@@ -66,10 +67,18 @@ try:
         payload["token"] = _tf.read().strip()
 except OSError:
     pass
+# Port: explicit TG_PORT wins; else the daemon's runtime port file; else 48632.
+port = os.environ.get("TG_PORT", "")
+if not port:
+    try:
+        with open(os.path.expanduser("~/.local/share/terminalghost/port")) as _pf:
+            port = _pf.read().strip()
+    except OSError:
+        pass
 line = json.dumps(payload) + "\n"
 try:
     with socket.create_connection(
-        (os.environ.get("TG_HOST", "127.0.0.1"), int(os.environ.get("TG_PORT", "48632"))),
+        (os.environ.get("TG_HOST", "127.0.0.1"), int(port or "48632")),
         timeout=0.5,
     ) as sock:
         sock.sendall(line.encode("utf-8"))

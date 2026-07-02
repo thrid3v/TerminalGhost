@@ -150,7 +150,7 @@ class HookReceiver:
                     await self._handle_reload(writer)
                     break
                 try:
-                    event, shell_pid, shell = self._parse_payload(text)
+                    event, shell_pid, shell = self._parse_payload(obj)
                 except ValueError as exc:
                     log.warning("invalid command event (%s): %.120s", exc, text)
                     continue
@@ -231,17 +231,14 @@ class HookReceiver:
 
     # -- payload parsing -----------------------------------------------------------
 
-    def _parse_payload(self, raw: str) -> tuple[CommandEvent, int | None, str | None]:
-        """Parse and validate one JSON line into a CommandEvent.
+    def _parse_payload(self, obj: dict) -> tuple[CommandEvent, int | None, str | None]:
+        """Validate one decoded JSON payload into a CommandEvent.
 
-        Returns (event, shell_pid, shell); session_id is 0 — the daemon
-        resolves the real session from shell_pid. Raises ValueError on any
-        missing/mistyped field.
+        The caller (_handle_connection) has already parsed the line and checked
+        it is a dict. Returns (event, shell_pid, shell); session_id is 0 — the
+        daemon resolves the real session from shell_pid. Raises ValueError on
+        any missing/mistyped field.
         """
-        obj = json.loads(raw)
-        if not isinstance(obj, dict):
-            raise ValueError("payload must be a JSON object")
-
         cmd = obj.get("cmd")
         if not isinstance(cmd, str) or not cmd:
             raise ValueError("cmd must be a non-empty string")

@@ -29,6 +29,16 @@ def test_extract_command_dollar_prompt_line():
     assert TriggerHandler._extract_command(answer) == "git checkout main"
 
 
+def test_extract_command_preserves_dollar_prefixed_command():
+    # A leading "$" that is part of the command (PowerShell) must survive;
+    # only a "$ " prompt marker is stripped.
+    answer = '```powershell\n$env:PATH = "C:\\tools;$env:PATH"\n```'
+    assert (
+        TriggerHandler._extract_command(answer)
+        == '$env:PATH = "C:\\tools;$env:PATH"'
+    )
+
+
 def test_extract_command_inline_fallback():
     assert TriggerHandler._extract_command("just run `npm install` first") == "npm install"
 

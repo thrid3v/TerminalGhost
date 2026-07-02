@@ -148,6 +148,10 @@ Everything is local by default. Command text is scanned for obvious secrets
 `capture.blocked_commands` never has its output stored. Switching to a cloud backend
 sends assembled context to that provider — your choice, off by default.
 
+To make TerminalGhost forget what it captured, run **`terminalghost clear`** (everything)
+or `terminalghost clear --last N` (just the last N commands — handy right after typing
+a secret). The database is vacuumed so deleted text actually leaves the file.
+
 ## Development
 
 ```bash

@@ -1,8 +1,9 @@
 # terminalghost.llm.backends.cloud
 #
-# Cloud LLM backend. Primary target is Anthropic Claude via the `anthropic`
-# SDK (imported lazily so the dependency stays optional at runtime);
-# OpenAI is a stub that raises NotImplementedError.
+# Cloud LLM backend. Anthropic Claude via the `anthropic` SDK (imported
+# lazily so the dependency stays optional at runtime), plus OpenAI and any
+# OpenAI-compatible server (Groq, LM Studio, llama.cpp, ...) over httpx+SSE
+# via the `base_url` knob.
 
 from __future__ import annotations
 

@@ -106,7 +106,7 @@ def make_receiver():
 
 
 def test_parse_valid_payload():
-    event, pid, shell = make_receiver()._parse_payload(json.dumps(valid_payload()))
+    event, pid, shell = make_receiver()._parse_payload(valid_payload())
     assert event.cmd == "make build"
     assert event.exit_code == 1
     assert event.cwd == "/home/user/project"
@@ -119,29 +119,22 @@ def test_parse_missing_cmd():
     payload = valid_payload()
     del payload["cmd"]
     with pytest.raises(ValueError, match="cmd"):
-        make_receiver()._parse_payload(json.dumps(payload))
+        make_receiver()._parse_payload(payload)
 
 
 def test_parse_exit_out_of_range():
     with pytest.raises(ValueError, match="exit"):
-        make_receiver()._parse_payload(json.dumps(valid_payload(exit=256)))
+        make_receiver()._parse_payload(valid_payload(exit=256))
 
 
 def test_parse_long_cmd_truncated():
-    event, _, _ = make_receiver()._parse_payload(
-        json.dumps(valid_payload(cmd="x" * 5000))
-    )
+    event, _, _ = make_receiver()._parse_payload(valid_payload(cmd="x" * 5000))
     assert len(event.cmd) == 4096
 
 
 def test_parse_negative_duration():
     with pytest.raises(ValueError, match="duration"):
-        make_receiver()._parse_payload(json.dumps(valid_payload(duration=-1)))
-
-
-def test_parse_non_json_raises():
-    with pytest.raises(json.JSONDecodeError):
-        make_receiver()._parse_payload("not json at all")
+        make_receiver()._parse_payload(valid_payload(duration=-1))
 
 
 # -- socket integration ------------------------------------------------------------

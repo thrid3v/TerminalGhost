@@ -97,6 +97,38 @@ def test_redact_output_masks_secret_lines():
     assert "<redacted>" in redacted
 
 
+# -- ?? query text is stored redacted ----------------------------------------
+
+
+class _StubTrigger:
+    def __init__(self):
+        self.seen_cmd = None
+
+    async def handle(self, cmd, cwd, send=None, pasted=None):
+        self.seen_cmd = cmd
+
+
+async def test_on_query_stores_redacted_but_queries_raw():
+    from terminalghost.config.loader import Config
+    from terminalghost.daemon.process import Daemon
+
+    db = Database(":memory:")
+    db.open()
+    daemon = Daemon(Config())  # redact_passwords defaults to True
+    daemon._db = db
+    trigger = _StubTrigger()
+    daemon._trigger = trigger
+    try:
+        await daemon._on_query("?? why does TOKEN=ghp_secret123 fail", "/proj", None)
+        stored = db.get_recent_commands()[0]
+        assert "ghp_secret123" not in stored.cmd
+        assert "<redacted>" in stored.cmd
+        # The live query keeps the user's original text for the LLM.
+        assert trigger.seen_cmd == "?? why does TOKEN=ghp_secret123 fail"
+    finally:
+        db.close()
+
+
 # -- cwd-scoped get_last_error ----------------------------------------------
 
 
