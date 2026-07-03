@@ -80,15 +80,22 @@ def cmd_log(
         )
         return 0
 
-    table = Table(title=None, expand=True, border_style="tg.muted", header_style="tg.header")
-    table.add_column("time", style="tg.muted", no_wrap=True)
+    from rich import box
+    from rich.markup import escape
+    from rich.text import Text
+
+    # Hairline table (rule under the header only) so the commands read as the
+    # content, not a spreadsheet.
+    table = Table(box=box.SIMPLE_HEAD, expand=True, pad_edge=False,
+                  border_style="tg.subtle", header_style="tg.eyebrow", padding=(0, 1))
+    table.add_column("time", style="tg.subtle", no_wrap=True)
     table.add_column("exit", justify="right", no_wrap=True)
-    table.add_column("ms", justify="right", style="tg.muted", no_wrap=True)
+    table.add_column("ms", justify="right", style="tg.subtle", no_wrap=True)
     table.add_column("dir", style="tg.muted", no_wrap=True, max_width=24)
     table.add_column("command", style="tg.cmd", overflow="fold")
 
-    from rich.markup import escape
-
+    console.print()
+    console.print(Text("  ● ", style="tg.accent").append("recent commands", style="tg.header"))
     for ev in reversed(events):  # oldest first, newest at the bottom
         when = time.strftime("%H:%M:%S", time.localtime(ev.ts))
         exit_style = "tg.ok" if ev.exit_code == 0 else "tg.fail"

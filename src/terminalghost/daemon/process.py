@@ -717,10 +717,10 @@ def _cmd_start(config: Config, config_path: str | None) -> int:
     console = console_for(config)
     port = _effective_port(config)  # resolves the bound port when general.port == 0
     console.print(
-        f"[tg.success]✓[/] daemon started (pid {real_pid}), listening on "
-        f"[tg.key]{config.general.host}:{port}[/]"
+        f"[tg.success]✓[/] daemon started [tg.subtle](pid {real_pid})[/] · "
+        f"listening on [tg.key]{config.general.host}:{port}[/]"
     )
-    console.print(f"[tg.muted]tip: {escape(random_tip())}[/]")
+    console.print(f"  [tg.eyebrow]tip:[/] [tg.subtle]{escape(random_tip())}[/]")
     return 0
 
 

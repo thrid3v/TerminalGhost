@@ -130,35 +130,49 @@ def _dir_writable(path: str) -> bool:
         return False
 
 
+# Widest label, so details line up in a clean second column.
+_LABEL_WIDTH = 18
+
+
 def cmd_doctor(config) -> int:
-    from rich.markup import escape
+    from rich.text import Text
 
     from terminalghost.ui import console_for
 
     console = console_for(config)
-    console.print("[tg.header]TerminalGhost doctor[/]\n")
+    console.print()
+    console.print(
+        Text("  ● ", style="tg.accent")
+        .append("doctor", style="tg.header")
+        .append("   checking your setup", style="tg.subtle")
+    )
+    console.print()
 
     checks = gather_checks(config)
-    symbol = {True: "[tg.ok]✓[/]", False: "[tg.fail]✗[/]", None: "[tg.warn]![/]"}
+    # ✓ ok · ○ heads-up · ✗ needs a fix — glyph + color, so it reads without color too.
+    glyph = {True: ("✓", "tg.ok"), False: ("✗", "tg.fail"), None: ("○", "tg.warn")}
     failed = 0
     for c in checks:
-        # Detail/fix can contain [..] (e.g. terminalghost[cloud]) — escape so
-        # Rich doesn't treat them as markup tags.
-        line = f"  {symbol[c.ok]} {escape(c.label)}"
+        mark, style = glyph[c.ok]
+        line = Text("  ").append(f"{mark}  ", style=style)
+        line.append(f"{c.label:<{_LABEL_WIDTH}}", style="tg.cmd")
         if c.detail:
-            line += f"  [tg.muted]{escape(c.detail)}[/]"
+            line.append(c.detail, style="tg.muted")
         console.print(line)
         if c.ok is False:
             failed += 1
             if c.fix:
-                console.print(f"      [tg.muted]fix:[/] [tg.key]{escape(c.fix)}[/]")
+                console.print(
+                    Text("       → ", style="tg.subtle").append(c.fix, style="tg.key")
+                )
 
     console.print()
     if failed == 0:
-        console.print("[tg.success]Everything looks good.[/]")
+        console.print("  [tg.success]All good.[/] [tg.subtle]The ghost is listening.[/]")
         _print_tip(console)
         return 0
-    console.print(f"[tg.warn]{failed} issue(s) found.[/] See fixes above.")
+    noun = "thing needs" if failed == 1 else "things need"
+    console.print(f"  [tg.warn]{failed} {noun} attention.[/] [tg.subtle]Fixes above.[/]")
     return 1
 
 
@@ -167,4 +181,4 @@ def _print_tip(console) -> None:
 
     from terminalghost.cli.tips import random_tip
 
-    console.print(f"[tg.muted]tip: {escape(random_tip())}[/]")
+    console.print(f"  [tg.eyebrow]tip:[/] [tg.subtle]{escape(random_tip())}[/]")

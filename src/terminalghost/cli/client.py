@@ -224,12 +224,16 @@ def _suggested_commands(config: "Config") -> list[str]:
 
 
 def _post_answer_actions(config: "Config") -> None:
-    """Show the suggested command(s) and an inline action bar; act on one keypress."""
-    from rich.panel import Panel
+    """Show the suggested command(s) inline under a rail; act on one keypress.
+
+    Deliberately not a box — the answer above is the hero surface; this is a
+    quiet action line beneath it. Risky commands glow amber instead of mint.
+    """
     from rich.text import Text
 
     from terminalghost.cli.risk import assess
     from terminalghost.ui import console_for
+    from terminalghost.ui.theme import RAIL_GLYPH
 
     commands = _suggested_commands(config)
     if not commands:
@@ -237,33 +241,29 @@ def _post_answer_actions(config: "Config") -> None:
     console = console_for(config)
     multi = len(commands) > 1
     warning = next((w for w in (assess(c) for c in commands) if w), None)
+    rail = "tg.warn" if warning else "tg.rail"
+
+    label = f"run these · {len(commands)} steps" if multi else "run this"
+    console.print()
+    console.print(f"  [tg.eyebrow]{label}[/]")
     if multi:
-        body = Text(
-            "\n".join(f"{i}. {c}" for i, c in enumerate(commands, start=1)),
-            style="tg.cmd",
-        )
-        title = f"▶ run these ({len(commands)} steps)"
+        for i, cmd in enumerate(commands, start=1):
+            console.print(
+                Text("  ").append(RAIL_GLYPH, style=rail)
+                .append(f" {i} ", style="tg.subtle")
+                .append(cmd, style="tg.cmd")
+            )
     else:
-        body = Text(commands[0], style="tg.cmd")
-        title = "▶ run this"
-    if warning:
-        title = "⚠ " + title.split(" ", 1)[1] + " (risky)"
-    console.print(
-        Panel(
-            body,
-            title=title,
-            title_align="left",
-            border_style="tg.warn" if warning else "tg.glow",
-            padding=(0, 1),
-            expand=False,
+        console.print(
+            Text("  ").append(RAIL_GLYPH + " ", style=rail)
+            .append(commands[0], style="tg.cmd")
         )
-    )
     if warning:
-        console.print(f"  [tg.warn]⚠ A step here {warning}.[/]")
-    actions = "  [tg.key]R[/] run   [tg.key]C[/] copy"
+        console.print(f"  [tg.warn]⚠ {'a step here' if multi else 'this'} {warning}[/]")
+    actions = "  [tg.key]\\[R][/] run   [tg.key]\\[C][/] copy"
     if not multi:
-        actions += "   [tg.key]E[/] edit"
-    console.print(actions + "   [tg.muted]· any other key dismiss[/]")
+        actions += "   [tg.key]\\[E][/] edit"
+    console.print(actions + "   [tg.subtle]· any other key to dismiss[/]")
     try:
         key = _read_key().lower()
     except (OSError, EOFError, KeyboardInterrupt):
@@ -601,14 +601,17 @@ def _cmd_hint(config: "Config") -> int:
     )
     if not text:
         return 0  # daemon down / no hint — never disrupt the prompt
-    from rich.markup import escape
+    from rich.text import Text
 
     from terminalghost.ui import console_for
     from terminalghost.ui.theme import GHOST_GLYPH
 
     line = text.splitlines()[0][:200]
     console = console_for(config)
-    console.print(f"[tg.muted]{GHOST_GLYPH} hint:[/] [tg.muted]{escape(line)}[/]")
+    # One quiet ghost-voice line: a mint mark, then the tip in fog.
+    console.print(
+        Text(f"{GHOST_GLYPH} ", style="tg.accent").append(line, style="tg.muted")
+    )
     return 0
 
 
@@ -624,7 +627,7 @@ def _print_unreachable(config: "Config") -> None:
 
 def _render_answer_plain(sock: socket.socket) -> str:
     """Stream the raw answer to stdout (pipe / no-color path). Returns the text."""
-    sys.stdout.write("TerminalGhost ▶\n\n")
+    sys.stdout.write("👻 TerminalGhost\n\n")
     sys.stdout.flush()
     collected: list[str] = []
     for chunk in _iter_socket_text(sock):
@@ -637,34 +640,46 @@ def _render_answer_plain(sock: socket.socket) -> str:
 
 
 def _render_answer_rich(config: "Config", sock: socket.socket, console=None) -> str:
-    """Render the streamed answer as live markdown with a spinner + footer.
+    """Render the streamed answer as a live card: ghost title, glowing fix-rail
+    in code blocks, and the model/timing folded into the card's subtitle.
 
     Returns the plain answer text (for --copy)."""
+    from rich import box
     from rich.live import Live
-    from rich.markdown import Markdown
     from rich.panel import Panel
     from rich.spinner import Spinner
     from rich.text import Text
 
-    from terminalghost.ui import console_for
+    from terminalghost.ui import console_for, ghost_markdown
     from terminalghost.ui.theme import GHOST_GLYPH
 
     if console is None:
         console = console_for(config)
 
-    title = f"{GHOST_GLYPH} TerminalGhost"
-
-    def card(content):
-        # The answer lives in a bordered card so it reads as one intentional
-        # reply rather than blending into shell scrollback.
-        return Panel(
-            content, title=title, title_align="left",
-            border_style="tg.glow", padding=(0, 1),
-        )
+    title = Text()
+    title.append(f"{GHOST_GLYPH} ", style="tg.accent")
+    title.append("TerminalGhost", style="tg.header")
 
     start = time.monotonic()
+
+    def subtitle() -> Text:
+        elapsed = time.monotonic() - start
+        return Text(
+            f"{config.llm.backend} · {_answering_model(config)} · {elapsed:.1f}s",
+            style="tg.footer",
+        )
+
+    def card(content, sub=None):
+        # The answer lives in one soft-bordered card — the single hero surface,
+        # so it reads as an intentional reply, not shell scrollback.
+        return Panel(
+            content, title=title, title_align="left",
+            subtitle=sub, subtitle_align="right",
+            border_style="tg.glow", box=box.ROUNDED, padding=(1, 2),
+        )
+
     buf: list[str] = []
-    spinner = Spinner("dots", text=Text(" thinking…", style="tg.muted"))
+    spinner = Spinner("dots", text=Text(" summoning…", style="tg.muted"))
     with Live(
         card(spinner),
         console=console,
@@ -673,16 +688,9 @@ def _render_answer_rich(config: "Config", sock: socket.socket, console=None) -> 
     ) as live:
         for chunk in _iter_socket_text(sock):
             buf.append(chunk)
-            live.update(card(Markdown("".join(buf).strip())))
+            live.update(card(ghost_markdown("".join(buf).strip()), subtitle()))
         if not buf:
             live.update(card(Text("(no response)", style="tg.muted")))
-
-    elapsed = time.monotonic() - start
-    footer = Text(
-        f"  {config.llm.backend} · {_answering_model(config)} · {elapsed:.1f}s",
-        style="tg.footer",
-    )
-    console.print(footer)
     return "".join(buf)
 
 

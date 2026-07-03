@@ -1,10 +1,11 @@
 # TerminalGhost
 
 ```
- .-.    TerminalGhost
-(o o)   ask your terminal anything — just type ??
-|=#=|   local-first · ollama · v0.2.0
- '-'
+  ╭──────────────────────────────────────────────────╮
+  │  👻   TerminalGhost                               │
+  │       a ghost in your shell — summon it with  ??  │
+  │       ● local · ollama · v0.4.0                   │
+  ╰──────────────────────────────────────────────────╯
 ```
 
 A local-first, terminal-resident AI assistant. A small background daemon watches your

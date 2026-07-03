@@ -63,13 +63,13 @@ def daemon_status(config) -> dict:
 
 
 def status_markup(st: dict) -> str:
-    dot = "[green]●[/] running" if st["running"] else "[red]●[/] stopped"
+    dot = "[#5FE3B3]●[/] running" if st["running"] else "[#FF7A93]●[/] stopped"
     if st["running"]:
-        dot += f" [dim](pid {st['pid']})[/]"
+        dot += f" [#5C6479](pid {st['pid']})[/]"
     return (
-        f"👻 [bold cyan]TerminalGhost[/]   {dot}   "
-        f"[magenta]{st['backend']}[/]·[cyan]{st['model']}[/]   "
-        f"[dim]{st['host']}:{st['port']}[/]"
+        f"👻 [bold #C9BEFF]TerminalGhost[/]   {dot}   "
+        f"[#A594FF]{st['backend']}[/][#5C6479]·[/][#5FE3B3]{st['model']}[/]   "
+        f"[#5C6479]{st['host']}:{st['port']}[/]"
     )
 
 
@@ -83,11 +83,16 @@ def _short_dir(path: str) -> str:
 
 class DashboardApp(App):
     CSS = """
-    Screen { layout: vertical; }
-    #status { height: 1; padding: 0 1; background: $panel; }
+    Screen { layout: vertical; background: #0d0d12; }
+    #status { height: 1; padding: 0 1; background: #16161f; color: #C9BEFF; }
     #commands { height: 1fr; }
-    #detail { height: 12; border-top: solid $primary; padding: 0 1; overflow-y: auto; }
-    DataTable > .datatable--cursor { background: $accent; }
+    #detail {
+        height: 12; border-top: solid #7E6FE0; padding: 0 1;
+        overflow-y: auto; color: #C6CBD8;
+    }
+    DataTable > .datatable--cursor { background: #7E6FE0; color: #F2F2F8; }
+    DataTable > .datatable--header { color: #5FA98C; text-style: bold; }
+    Footer { background: #16161f; }
     """
     BINDINGS = [
         Binding("q", "quit", "Quit"),
