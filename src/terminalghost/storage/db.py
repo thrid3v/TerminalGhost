@@ -232,6 +232,25 @@ class Database:
             row = conn.execute(query, params).fetchone()
         return _row_to_event(row) if row else None
 
+    def get_recent_errors(self, cwd: str | None = None, limit: int = 5) -> list[CommandEvent]:
+        """The `limit` most recent failing commands, newest first.
+
+        Used to cluster a `??` around the errors related to the one being asked
+        about (same tool), instead of only the single latest failure.
+        """
+        conn = self._require_conn()
+        limit = max(0, min(limit, self._history_size))
+        query = f"SELECT {_COLUMNS} FROM commands WHERE exit_code != 0"
+        params: list = []
+        if cwd is not None:
+            query += " AND cwd = ?"
+            params.append(cwd)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            rows = conn.execute(query, params).fetchall()
+        return [_row_to_event(row) for row in rows]
+
     def clear_commands(self, last: int | None = None) -> int:
         """Delete captured commands and return how many rows were removed.
 
