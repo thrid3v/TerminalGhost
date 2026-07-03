@@ -216,6 +216,34 @@ def test_clear_commands_shrinks_file(tmp_path):
         db.close()
 
 
+# -- recent errors ---------------------------------------------------------------------
+
+
+def test_get_recent_errors_newest_first_and_limit(db):
+    db.insert_command(make_event(cmd="ok-1", exit_code=0))
+    db.insert_command(make_event(cmd="fail-1", exit_code=1))
+    db.insert_command(make_event(cmd="ok-2", exit_code=0))
+    db.insert_command(make_event(cmd="fail-2", exit_code=2))
+    db.insert_command(make_event(cmd="fail-3", exit_code=1))
+    errors = db.get_recent_errors(limit=2)
+    assert [e.cmd for e in errors] == ["fail-3", "fail-2"]  # newest first, capped
+    assert all(e.exit_code != 0 for e in errors)
+
+
+def test_get_recent_errors_scoped_by_cwd(db):
+    db.insert_command(make_event(cmd="a", exit_code=1, ts=None))
+    # different cwd
+    ev = make_event(cmd="b", exit_code=1)
+    ev.cwd = "/other"
+    db.insert_command(ev)
+    here = db.get_recent_errors(cwd="/home/user")
+    assert [e.cmd for e in here] == ["a"]
+
+
+def test_get_recent_errors_empty(db):
+    assert db.get_recent_errors() == []
+
+
 # -- rolling buffer -------------------------------------------------------------------
 
 

@@ -24,6 +24,10 @@ log = logging.getLogger(__name__)
 
 TREE_ENTRY_CAP = 200
 HISTORY_FETCH_LIMIT = 50
+# How many recent failures to scan when clustering, and how many same-tool ones
+# to actually surface alongside the anchor error.
+RELATED_ERROR_SCAN = 12
+RELATED_ERROR_CAP = 3
 # Hard cap on the auto project-context section so a giant manifest can't
 # crowd out command history in the token budget.
 PROJECT_CONTEXT_MAX_CHARS = 900
@@ -40,9 +44,12 @@ _PREAMBLE = (
     "- Ground every claim in what is actually shown. Never invent file names,\n"
     "  flags, commands, package names, or error messages that do not appear in\n"
     "  the context.\n"
-    "- When a command failed, state the real cause in one line, then give the\n"
-    "  exact fix command(s) FIRST in a code block (copy-paste ready), then at\n"
-    "  most one short line of why.\n"
+    "- When a command failed: first explain the actual cause in 1-2 plain\n"
+    "  sentences (what went wrong and why), then give the exact fix command(s)\n"
+    "  in a code block, copy-paste ready.\n"
+    "- If several recent failures come from the same tool (shown as earlier\n"
+    "  failures), treat them as ONE ongoing problem and fix the root cause, not\n"
+    "  each symptom.\n"
     "- If the failing command's output is NOT shown, say so plainly and tell the\n"
     "  user to re-run it with `tgr <command>` so you can see the real error;\n"
     "  give your best guess only after, and mark it as a guess.\n"
@@ -103,6 +110,10 @@ class ContextAssembler:
         # Scope the surfaced error to this directory so a ?? doesn't pick up an
         # unrelated failure from another terminal/project.
         last_error = self._db.get_last_error(cwd=cwd)
+        # Cluster around the error being asked about: pull the earlier failures
+        # from the SAME tool (git vs docker vs npm...) so the model sees the
+        # thread, not an unrelated failure that just happened to be recent.
+        related_errors = self._related_errors(cwd, last_error)
         # newest-first from the DB; the prompt wants oldest-first
         commands = list(reversed(self._db.get_recent_commands(limit=HISTORY_FETCH_LIMIT)))
         tree = self._format_directory_tree(cwd)
@@ -137,6 +148,8 @@ class ContextAssembler:
                 parts.append(f"## Earlier in this conversation\nQ: {q}\nA: {a}")
             if last_error is not None:
                 parts.append(self._format_last_error(last_error))
+            if related_errors:
+                parts.append(self._format_related_errors(last_error, related_errors))
             if source:
                 parts.append(source)
             if cmds:
@@ -202,6 +215,41 @@ class ContextAssembler:
             if event.output:
                 for out_line in event.output.splitlines()[:10]:
                     lines.append(f"   output: {out_line}")
+        return "\n".join(lines)
+
+    def _related_errors(
+        self, cwd: str, anchor: "CommandEvent | None"
+    ) -> list["CommandEvent"]:
+        """Earlier failures from the same tool as `anchor`, oldest first.
+
+        This is what lets a ?? about a git error ignore the docker errors that
+        happened just before it — same-tool failures are the actual thread.
+        """
+        if anchor is None:
+            return []
+        tool = _command_tool(anchor.cmd)
+        if not tool:
+            return []
+        recent = self._db.get_recent_errors(cwd=cwd, limit=RELATED_ERROR_SCAN)
+        related = [
+            e for e in recent
+            if e.id != anchor.id and _command_tool(e.cmd) == tool
+        ][:RELATED_ERROR_CAP]
+        return list(reversed(related))  # oldest → newest for a readable thread
+
+    def _format_related_errors(
+        self, anchor: "CommandEvent | None", related: list["CommandEvent"]
+    ) -> str:
+        tool = _command_tool(anchor.cmd) if anchor else "this tool"
+        lines = [
+            f"## Earlier `{tool}` failures leading up to this (oldest first)",
+            "These are likely the same underlying problem; address the root cause.",
+        ]
+        for i, e in enumerate(related, start=1):
+            lines.append(f"{i}. $ {e.cmd}  (exit {e.exit_code})")
+            if e.output:
+                for out_line in e.output.splitlines()[:6]:
+                    lines.append(f"   {out_line}")
         return "\n".join(lines)
 
     def _format_last_error(self, event: "CommandEvent") -> str:
@@ -326,6 +374,32 @@ class ContextAssembler:
 def _is_trigger_cmd(cmd: str) -> bool:
     """True for TerminalGhost's own ?? queries (noise in the command history)."""
     return cmd.strip().startswith("??")
+
+
+# Prefixes that wrap another command — skip them to find the real program.
+_CMD_WRAPPERS = {"sudo", "command", "time", "env", "nice", "nohup", "exec",
+                 "doas", "xargs", "watch", "strace", "ltrace"}
+_ENV_ASSIGN_RE = re.compile(r"^\w+=")
+
+
+def _command_tool(cmd: str) -> str | None:
+    """The program a command runs, normalized — the key for grouping errors.
+
+    `git push --force` → "git"; `sudo docker build .` → "docker";
+    `FOO=bar npm run x` → "npm"; `./gradlew build` → "gradlew". None if empty.
+    """
+    for token in cmd.strip().split():
+        if _ENV_ASSIGN_RE.match(token):  # leading VAR=val
+            continue
+        if token in _CMD_WRAPPERS:
+            continue
+        # basename, drop path + a trailing .exe/.cmd so "python3" == "python3".
+        name = token.replace("\\", "/").split("/")[-1].lower()
+        for suffix in (".exe", ".cmd", ".bat", ".ps1"):
+            if name.endswith(suffix):
+                name = name[: -len(suffix)]
+        return name or None
+    return None
 
 
 # -- project context helpers ----------------------------------------------------

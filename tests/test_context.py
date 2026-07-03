@@ -366,6 +366,52 @@ def test_history_format_marks_error_and_orders_oldest_first(db):
     assert "FAILED" in failed_line
 
 
+# -- tool-aware error clustering ----------------------------------------------
+
+
+def test_command_tool_normalizes():
+    from terminalghost.context.assembler import _command_tool
+
+    assert _command_tool("git push --force") == "git"
+    assert _command_tool("sudo docker build .") == "docker"
+    assert _command_tool("FOO=bar npm run build") == "npm"
+    assert _command_tool("./gradlew test") == "gradlew"
+    assert _command_tool("python3 app.py") == "python3"
+    assert _command_tool("C:\\tools\\node.exe server.js") == "node"
+    assert _command_tool("   ") is None
+
+
+def test_clusters_related_errors_ignores_unrelated(db):
+    # Three docker failures, then a git failure on top — asking about git must
+    # surface the git thread and NOT the docker noise.
+    db.insert_command(make_event("docker build .", exit_code=1, output="docker err 1"))
+    db.insert_command(make_event("docker run app", exit_code=1, output="docker err 2"))
+    db.insert_command(make_event("git commit -m x", exit_code=1, output="nothing to commit"))
+    db.insert_command(make_event("git push", exit_code=1, output="rejected: fetch first"))
+    prompt = ContextAssembler(db, Config()).assemble("/proj")
+    assert "Earlier `git` failures" in prompt
+    # Isolate just the cluster block (header → next "## " section).
+    cluster = prompt.split("## Earlier `git`")[1].split("\n## ")[0]
+    assert "git commit -m x" in cluster         # the related git failure
+    assert "docker" not in cluster              # docker noise excluded from the thread
+
+
+def test_no_related_section_when_only_one_tool_error(db):
+    db.insert_command(make_event("make build", exit_code=2, output="boom"))
+    prompt = ContextAssembler(db, Config()).assemble("/proj")
+    assert "Earlier `make` failures" not in prompt  # nothing to cluster
+
+
+def test_related_errors_ordered_oldest_first(db):
+    db.insert_command(make_event("npm ci", exit_code=1))
+    db.insert_command(make_event("npm run build", exit_code=1))
+    db.insert_command(make_event("npm test", exit_code=1))
+    section = ContextAssembler(db, Config())._format_related_errors(
+        db.get_last_error(), ContextAssembler(db, Config())._related_errors("/proj", db.get_last_error())
+    )
+    assert section.index("npm ci") < section.index("npm run build")
+
+
 # -- smarter prompt: grounding, blind marker, ?? filtering --------------------
 
 

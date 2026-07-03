@@ -167,6 +167,10 @@ like `File "app/main.py", line 42` pulls the ~12 lines around line 42 of your re
 file into the prompt, so the model debugs your code instead of guessing from the
 command name.
 
+It also **clusters by tool**: if your last error is a `git` failure sitting on top
+of three unrelated `docker` failures, `??` surfaces the *git* thread and ignores the
+docker noise — so it explains the error you actually asked about, then offers the fix.
+
 It's targeted, not a blind repo dump: only the files the error names, only a small
 window each, capped to fit the token budget. And it's privacy-first —
 
