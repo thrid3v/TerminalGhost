@@ -305,6 +305,48 @@ async def test_rapid_triggers_serialized(handler):
     assert backend.stream_calls == 2
 
 
+# -- blind-failure nudge ------------------------------------------------------
+
+
+def _fail_event(cmd="make build", output=None):
+    import types
+
+    return types.SimpleNamespace(
+        cmd=cmd, output=output, exit_code=2, id=1, cwd="/proj",
+    )
+
+
+async def test_blind_failure_nudges_to_tgr():
+    # Failing command whose output was never captured → guide the user to tgr.
+    db = FakeDB(_fail_event(), recent=[_fail_event()])
+    backend = FakeBackend(chunks=("```\nnpm install\n```",))
+    h = TriggerHandler(db, FakeAssembler(), backend, Config())
+    out, send = collect_sink()
+    await h.handle("?? fix", "/proj", send=send)
+    text = "".join(out)
+    assert "tgr make build" in text
+    assert "best guess" in text
+    # The nudge's own `tgr ...` must NOT become the applyable suggestion.
+    assert h.last_suggestion() == "npm install"
+
+
+async def test_no_nudge_when_output_present():
+    db = FakeDB(_fail_event(output="undefined reference"), recent=[_fail_event()])
+    h = TriggerHandler(db, FakeAssembler(), FakeBackend(), Config())
+    out, send = collect_sink()
+    await h.handle("?? fix", "/proj", send=send)
+    assert "tgr" not in "".join(out)
+
+
+async def test_no_nudge_when_user_pasted_output():
+    # `explain` supplies the output itself — don't tell them to capture it.
+    db = FakeDB(_fail_event(), recent=[_fail_event()])
+    h = TriggerHandler(db, FakeAssembler(), FakeBackend(), Config())
+    out, send = collect_sink()
+    await h.handle("?? explain this", "/proj", send=send, pasted="ERROR: boom")
+    assert "tgr" not in "".join(out)
+
+
 # -- recap --------------------------------------------------------------------
 
 

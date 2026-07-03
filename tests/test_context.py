@@ -364,3 +364,38 @@ def test_history_format_marks_error_and_orders_oldest_first(db):
     assert section.index("first-cmd") < section.index("bad-cmd") < section.index("last-cmd")
     failed_line = next(line for line in section.splitlines() if "bad-cmd" in line)
     assert "FAILED" in failed_line
+
+
+# -- smarter prompt: grounding, blind marker, ?? filtering --------------------
+
+
+def test_preamble_forbids_invention_and_asks_for_output(db):
+    prompt = ContextAssembler(db, Config()).assemble("/proj")
+    assert "Never invent" in prompt
+    assert "tgr" in prompt  # instructs the model to ask for captured output
+
+
+def test_history_excludes_trigger_queries(db):
+    db.insert_command(make_event("make build", exit_code=1))
+    db.insert_command(make_event("?? why did it fail"))
+    db.insert_command(make_event("qq fix"))  # not a ?? prefix, kept
+    assembler = ContextAssembler(db, Config())
+    section = assembler._format_command_history(
+        list(reversed(db.get_recent_commands())), db.get_last_error()
+    )
+    assert "make build" in section
+    assert "?? why did it fail" not in section
+
+
+def test_last_error_marks_missing_output(db):
+    ev = make_event("make build", exit_code=2, cwd="/proj")  # no output captured
+    section = ContextAssembler(db, Config())._format_last_error(ev)
+    assert "not captured" in section
+    assert "tgr" in section
+
+
+def test_last_error_shows_output_when_present(db):
+    ev = make_event("make build", exit_code=2, output="undefined reference to main")
+    section = ContextAssembler(db, Config())._format_last_error(ev)
+    assert "undefined reference to main" in section
+    assert "not captured" not in section
