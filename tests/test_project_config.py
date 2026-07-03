@@ -44,12 +44,18 @@ def test_loosening_directions_ignored(tmp_path):
     # A repo trying to *enable* output capture or *disable* redaction is a no-op.
     _write(tmp_path, (
         "[capture]\ncapture_output = true\nredact_passwords = false\n"
-        "[context]\nproject_context = true\n"
+        "[context]\nproject_context = true\nread_source = true\n"
     ))
     proj = load_project_overrides(str(tmp_path))
     assert proj.capture_output_off is False
     assert proj.redact_passwords_on is False
     assert proj.project_context_off is False
+    assert proj.read_source_off is False
+
+
+def test_read_source_off_honored(tmp_path):
+    _write(tmp_path, "[context]\nread_source = false\n")
+    assert load_project_overrides(str(tmp_path)).read_source_off is True
 
 
 def test_llm_section_ignored(tmp_path, caplog):

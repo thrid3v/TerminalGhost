@@ -25,6 +25,7 @@ DEFAULT_CONFIG_PATH = os.path.join("~", ".config", "terminalghost", "config.toml
 VALID_BACKENDS = ("ollama", "claude", "openai")
 VALID_COLOR_MODES = ("auto", "always", "never")
 VALID_THEMES = ("dark", "light", "high-contrast")
+VALID_READ_SOURCE = ("off", "local", "always")
 
 
 class ConfigError(Exception):
@@ -93,6 +94,11 @@ class ContextConfig:
     # Fold project facts (git branch/dirty state, manifest snippets like
     # package.json deps) into the prompt automatically.
     project_context: bool = True
+    # Read the source around a failing error's file:line refs into the prompt so
+    # the model debugs real code, not blindly. "off" | "local" (only for a local
+    # backend — Ollama or a localhost OpenAI server) | "always" (incl. cloud,
+    # where your source would leave the machine).
+    read_source: str = "local"
 
 
 @dataclass(frozen=True)
@@ -289,6 +295,12 @@ def _validate(raw: dict) -> None:
     theme = _get(raw, "ui", "theme")
     if theme is not None and theme not in VALID_THEMES:
         raise ConfigError(f"ui.theme must be one of {VALID_THEMES}, got {theme!r}")
+
+    read_source = _get(raw, "context", "read_source")
+    if read_source is not None and read_source not in VALID_READ_SOURCE:
+        raise ConfigError(
+            f"context.read_source must be one of {VALID_READ_SOURCE}, got {read_source!r}"
+        )
 
 
 def _make(cls, section) -> object:

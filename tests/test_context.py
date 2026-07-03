@@ -220,6 +220,15 @@ def test_project_context_requirements_capped(db, tmp_path):
     assert "(+3 more)" in prompt
 
 
+def test_read_source_config_default_and_validation():
+    from terminalghost.config.loader import ConfigError, _build_config, _validate
+
+    assert _build_config({}).context.read_source == "local"
+    assert _build_config({"context": {"read_source": "off"}}).context.read_source == "off"
+    with pytest.raises(ConfigError):
+        _validate({"context": {"read_source": "sometimes"}})
+
+
 def test_project_context_disabled_by_config(db, tmp_path):
     (tmp_path / "requirements.txt").write_text("flask==3.0\n", encoding="utf-8")
     config = Config()
@@ -236,6 +245,85 @@ def test_project_context_survives_malformed_manifest(db, tmp_path):
     assembler = ContextAssembler(db, Config())
     prompt = assembler.assemble(str(tmp_path))  # must not raise
     assert "Current directory" in prompt
+
+
+# -- error-driven source context (wiring) ------------------------------------
+
+
+def _local_cfg(**ctx):
+    base = Config()
+    return dataclasses.replace(base, context=dataclasses.replace(base.context, **ctx))
+
+
+def _repo_with_source(tmp_path, rows=30):
+    """A tmp project (.git + app/main.py with numbered lines)."""
+    (tmp_path / ".git").mkdir()
+    app = tmp_path / "app"
+    app.mkdir()
+    (app / "main.py").write_text(
+        "\n".join(f"row {i}" for i in range(1, rows + 1)), encoding="utf-8"
+    )
+
+
+def test_source_included_for_local_backend(db, tmp_path):
+    _repo_with_source(tmp_path)
+    # A failing command whose captured output references the file.
+    db.insert_command(make_event(
+        "python app/main.py", exit_code=1, cwd=str(tmp_path),
+        output='Traceback:\n  File "app/main.py", line 12, in <module>\nBoom',
+    ))
+    assembler = ContextAssembler(db, Config())  # default read_source="local", ollama
+    prompt = assembler.assemble(str(tmp_path))
+    assert "## Relevant source" in prompt
+    assert "app/main.py:12" in prompt
+    assert "row 12" in prompt
+
+
+def test_source_skipped_for_cloud_backend_in_local_mode(db, tmp_path):
+    _repo_with_source(tmp_path)
+    db.insert_command(make_event(
+        "python app/main.py", exit_code=1, cwd=str(tmp_path),
+        output='  File "app/main.py", line 12, in run\nBoom',
+    ))
+    cfg = Config()
+    cfg = dataclasses.replace(cfg, llm=dataclasses.replace(cfg.llm, backend="claude"))
+    prompt = ContextAssembler(db, cfg).assemble(str(tmp_path))
+    assert "## Relevant source" not in prompt  # cloud + "local" mode → no source
+
+
+def test_source_always_mode_includes_for_cloud(db, tmp_path):
+    _repo_with_source(tmp_path)
+    db.insert_command(make_event(
+        "python app/main.py", exit_code=1, cwd=str(tmp_path),
+        output='  File "app/main.py", line 12, in run\nBoom',
+    ))
+    cfg = Config()
+    cfg = dataclasses.replace(cfg,
+        llm=dataclasses.replace(cfg.llm, backend="claude"),
+        context=dataclasses.replace(cfg.context, read_source="always"))
+    prompt = ContextAssembler(db, cfg).assemble(str(tmp_path))
+    assert "## Relevant source" in prompt
+
+
+def test_source_off_mode(db, tmp_path):
+    _repo_with_source(tmp_path)
+    db.insert_command(make_event(
+        "python app/main.py", exit_code=1, cwd=str(tmp_path),
+        output='  File "app/main.py", line 12, in run',
+    ))
+    prompt = ContextAssembler(db, _local_cfg(read_source="off")).assemble(str(tmp_path))
+    assert "## Relevant source" not in prompt
+
+
+def test_project_fingerprint_tasks(db, tmp_path):
+    import json as _json
+    (tmp_path / "package.json").write_text(
+        _json.dumps({"scripts": {"build": "tsc", "test": "jest"},
+                     "dependencies": {"react": "^18"}}), encoding="utf-8")
+    (tmp_path / "Makefile").write_text("build:\n\ttsc\ndeploy:\n\t./ship.sh\n", encoding="utf-8")
+    prompt = ContextAssembler(db, Config()).assemble(str(tmp_path))
+    assert "npm run: build, test" in prompt
+    assert "make: build, deploy" in prompt
 
 
 def test_git_summary_parses(monkeypatch):

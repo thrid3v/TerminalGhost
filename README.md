@@ -150,12 +150,37 @@ Highlights:
 - `[general] port = 0` picks a free port automatically.
 - `[llm] followup_seconds` controls the conversational follow-up window.
 - `[context] project_context` (default on) folds project facts into every `??`:
-  git branch + dirty state, and key dependencies from `package.json`,
-  `pyproject.toml`, `requirements.txt`, `Cargo.toml`, or `go.mod` — so "why does
-  this fail" answers know your versions without you pasting them.
+  git branch + dirty state, key dependencies (`package.json`, `pyproject.toml`,
+  `requirements.txt`, `Cargo.toml`, `go.mod`), and the project's run tasks (npm
+  scripts / make targets) — so answers know your setup without you pasting it.
+- `[context] read_source` (default `local`) reads the source around a failing
+  error's `file:line` refs — see [Project-aware debugging](#project-aware-debugging).
 - `[ui] notify_after_seconds` (default 20) rings the terminal bell — plus a
   desktop notification on macOS/Linux — when a slow answer finishes, so you can
   tab away from a big local model. Set 0 to disable.
+
+## Project-aware debugging
+
+TerminalGhost doesn't just see your command — when the error is a stack trace or
+compiler message, it reads **the actual source the error points at**. A traceback
+like `File "app/main.py", line 42` pulls the ~12 lines around line 42 of your real
+file into the prompt, so the model debugs your code instead of guessing from the
+command name.
+
+It's targeted, not a blind repo dump: only the files the error names, only a small
+window each, capped to fit the token budget. And it's privacy-first —
+
+- only files **inside the project** are read (never an absolute path the output
+  happens to mention, like `/etc/...`);
+- `.gitignore`'d files and obvious secret files (`.env`, `*.pem`, `id_rsa`, …) are
+  skipped, and every snippet is run through secret redaction before it ships;
+- `[context] read_source` controls it: `local` (default — read only for a local
+  Ollama/localhost backend, so nothing leaves your machine), `always` (include
+  cloud backends), or `off`. A repo can tighten this to `off` via its own
+  `.terminalghost.toml` (see [per-project privacy](#privacy)).
+
+This works best with output capture on (below) and a coding-grade model — the
+sharper the model, the more it does with the extra context.
 
 ## Output capture (experimental, opt-in)
 

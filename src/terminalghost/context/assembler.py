@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 from typing import TYPE_CHECKING
 
@@ -93,12 +94,23 @@ class ContextAssembler:
         # A repo-local .terminalghost.toml can opt this project out.
         from terminalghost.config.project import load_project_overrides
 
+        overrides = load_project_overrides(cwd)
         project = (
             self._format_project_context(cwd)
-            if self._config.context.project_context
-            and not load_project_overrides(cwd).project_context_off
+            if self._config.context.project_context and not overrides.project_context_off
             else None
         )
+        # Read the source around the error's file:line refs so the model debugs
+        # real code. Scoped to the failing output the model can actually see.
+        source = None
+        if self._source_enabled(overrides):
+            error_text = "\n".join(
+                t for t in (pasted, last_error.output if last_error else None) if t
+            )
+            if error_text:
+                from terminalghost.context.source import collect_source_context
+
+                source = collect_source_context(error_text, cwd)
         preamble = _PREAMBLE + _INTENT_SUFFIX.get(intent, "")
 
         def build(cmds: list, tree_text: str) -> str:
@@ -110,6 +122,8 @@ class ContextAssembler:
                 parts.append(f"## Earlier in this conversation\nQ: {q}\nA: {a}")
             if last_error is not None:
                 parts.append(self._format_last_error(last_error))
+            if source:
+                parts.append(source)
             if cmds:
                 parts.append(self._format_command_history(cmds, last_error))
             if project:
@@ -183,14 +197,43 @@ class ContextAssembler:
             lines.extend(event.output.splitlines()[:20])
         return "\n".join(lines)
 
-    def _format_project_context(self, cwd: str) -> str | None:
-        """Auto-detected project facts: git state + manifest snippets.
+    def _source_enabled(self, overrides) -> bool:
+        """Whether to read error-referenced source into the prompt for this run.
 
-        Half of "why does this fail" answers hinge on versions/branch state
-        the user didn't think to mention. Everything here is best-effort and
+        "off" never; "always" including cloud (source would leave the machine);
+        "local" only when the backend is local (Ollama, or a localhost OpenAI-
+        compatible server). A repo-local override can always force it off.
+        """
+        mode = self._config.context.read_source
+        if mode == "off" or overrides.read_source_off:
+            return False
+        if mode == "always":
+            return True
+        return self._backend_is_local()  # mode == "local"
+
+    def _backend_is_local(self) -> bool:
+        llm = self._config.llm
+        if llm.backend == "ollama":
+            return True
+        if llm.backend == "openai":
+            url = llm.openai.base_url
+            return "://localhost" in url or "://127.0.0.1" in url
+        return False  # claude / remote
+
+    def _format_project_context(self, cwd: str) -> str | None:
+        """Auto-detected project facts: git state, manifest deps, and a small
+        "how to run it" fingerprint (project root + package.json/Makefile tasks).
+
+        Half of "why does this fail" answers hinge on versions/branch state or
+        the actual run command the user didn't think to mention. Best-effort and
         hard-capped so it can't crowd out command history.
         """
+        from terminalghost.context.source import find_project_root
+
         lines: list[str] = []
+        root = find_project_root(cwd)
+        if os.path.abspath(root) != os.path.abspath(cwd):
+            lines.append(f"root: {root}")
         git = _git_summary(cwd)
         if git:
             lines.append(git)
@@ -204,6 +247,9 @@ class ContextAssembler:
                 snippet = None
             if snippet:
                 lines.append(f"{filename}: {snippet}")
+        tasks = _run_tasks(cwd)
+        if tasks:
+            lines.append(tasks)
         if not lines:
             return None
         text = "## Project\n" + "\n".join(lines)
@@ -253,6 +299,45 @@ class ContextAssembler:
 
 
 # -- project context helpers ----------------------------------------------------
+
+_TASK_CAP = 8  # run-tasks listed per source
+_MAKE_TARGET_RE = re.compile(r"^([A-Za-z0-9][\w.-]*)\s*:(?!=)")
+
+
+def _run_tasks(cwd: str) -> str | None:
+    """A one-line "how to run this" fingerprint: package.json scripts and/or
+    Makefile targets, so the model knows the real build/test commands."""
+    parts: list[str] = []
+    pkg = os.path.join(cwd, "package.json")
+    if os.path.isfile(pkg):
+        try:
+            with open(pkg, encoding="utf-8-sig") as fh:
+                scripts = json.load(fh).get("scripts")
+        except (OSError, json.JSONDecodeError, ValueError, AttributeError):
+            scripts = None
+        if isinstance(scripts, dict) and scripts:
+            names = list(scripts)[:_TASK_CAP]
+            parts.append("npm run: " + ", ".join(names))
+
+    makefile = next(
+        (os.path.join(cwd, n) for n in ("Makefile", "makefile", "GNUmakefile")
+         if os.path.isfile(os.path.join(cwd, n))), None
+    )
+    if makefile:
+        targets: list[str] = []
+        try:
+            with open(makefile, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    m = _MAKE_TARGET_RE.match(line)
+                    if m and m.group(1) != ".PHONY" and m.group(1) not in targets:
+                        targets.append(m.group(1))
+                    if len(targets) >= _TASK_CAP:
+                        break
+        except OSError:
+            targets = []
+        if targets:
+            parts.append("make: " + ", ".join(targets))
+    return "tasks — " + "; ".join(parts) if parts else None
 
 
 def _git_summary(cwd: str) -> str | None:

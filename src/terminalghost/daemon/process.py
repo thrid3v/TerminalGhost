@@ -30,6 +30,7 @@ import psutil
 from terminalghost.capture.shell_hooks import HookReceiver
 from terminalghost.config.loader import Config, ConfigError, load_config
 from terminalghost.config.project import load_project_overrides
+from terminalghost.redaction import redact_command, redact_output, redact_secrets
 from terminalghost.context.assembler import ContextAssembler
 from terminalghost.llm.base import get_backend
 from terminalghost.runtime import (
@@ -307,57 +308,11 @@ def _trim_output(output: str, max_lines: int) -> str:
     return "\n".join(lines)
 
 
-# Secret-bearing patterns, redacted before storage so they never reach the
-# database or a cloud LLM. Applied to both command text and captured output.
-_SECRET_ASSIGN_RE = re.compile(
-    r"(?i)\b([A-Z0-9_]*(?:PASSWORD|PASSWD|TOKEN|SECRET|API[_-]?KEY)[A-Z0-9_]*)=(\S+)"
-)
-_SECRET_FLAG_RE = re.compile(
-    r"(?i)(--?(?:password|passwd|pass|token|secret|api[_-]?key)[=\s])(\S+)"
-)
-_BEARER_RE = re.compile(r"(?i)(bearer\s+)([A-Za-z0-9._\-]{8,})")
-_URL_CRED_RE = re.compile(r"([a-z][a-z0-9+.\-]*://[^:@/\s]+):([^@/\s]+)@")
-# Well-known token literals (GitHub, OpenAI/Anthropic, Slack, AWS access keys).
-_TOKEN_LITERAL_RE = re.compile(
-    r"\b("
-    r"gh[opsu]_[A-Za-z0-9]{20,}"
-    r"|sk-(?:ant-)?[A-Za-z0-9_\-]{16,}"
-    r"|xox[baprs]-[A-Za-z0-9\-]{10,}"
-    r"|AKIA[0-9A-Z]{16}"
-    r")\b"
-)
-
-
-def _redact_secrets(text: str) -> str:
-    """Redact obvious secrets (assignments, flags, bearer tokens, URL creds,
-    well-known key literals) anywhere in `text`."""
-    text = _SECRET_ASSIGN_RE.sub(r"\1=<redacted>", text)
-    text = _SECRET_FLAG_RE.sub(r"\1<redacted>", text)
-    text = _BEARER_RE.sub(r"\1<redacted>", text)
-    text = _TOKEN_LITERAL_RE.sub("<redacted>", text)
-    text = _URL_CRED_RE.sub(r"\1:<redacted>@", text)
-    return text
-
-
-def _redact_command(cmd: str) -> str:
-    return _redact_secrets(cmd)
-
-
-def _redact_output(output: str) -> str:
-    """Mask secret-looking value lines, then redact token literals everywhere."""
-    sensitive = re.compile(r"(?i)\b(password|passphrase|token|secret|api[-_]?key)\b")
-    redacted = []
-    suppress_next = False
-    for line in output.splitlines():
-        if suppress_next:
-            redacted.append("<redacted>")
-            suppress_next = False
-        elif sensitive.search(line):
-            redacted.append("<redacted>")
-            suppress_next = True  # the following line is often the echoed value
-        else:
-            redacted.append(line)
-    return _redact_secrets("\n".join(redacted))
+# Redaction lives in terminalghost.redaction (shared with the context layer).
+# Keep the private aliases so existing call sites + tests keep importing them.
+_redact_secrets = redact_secrets
+_redact_command = redact_command
+_redact_output = redact_output
 
 
 def _cmd_redact_check(config: Config, text: str) -> int:
