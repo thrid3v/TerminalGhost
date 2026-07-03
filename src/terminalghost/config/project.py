@@ -14,6 +14,7 @@
 #
 #   [context]
 #   project_context = false         # keep manifests/git state out of prompts
+#   read_source = false             # never read this repo's source into a prompt
 #
 # Anything else — [llm], [general], loosening values — is ignored. A repo must
 # never be able to switch your backend, point base_url at an attacker's
@@ -40,6 +41,7 @@ class ProjectOverrides:
     redact_passwords_on: bool = False
     extra_blocked: tuple[str, ...] = ()
     project_context_off: bool = False
+    read_source_off: bool = False
     path: str | None = None  # where the file was found (None → no overrides)
 
 
@@ -114,5 +116,6 @@ def _parse(path: str) -> ProjectOverrides:
         redact_passwords_on=capture.get("redact_passwords") is True,
         extra_blocked=extra_blocked,
         project_context_off=context.get("project_context") is False,
+        read_source_off=context.get("read_source") is False,
         path=path,
     )

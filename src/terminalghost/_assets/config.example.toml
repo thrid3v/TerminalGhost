@@ -54,8 +54,16 @@ tree_ignore = [".git", "__pycache__", "node_modules", ".venv"]
 token_budget = 3000
 # Fold project facts into the prompt automatically: git branch + dirty state,
 # key dependencies from package.json / pyproject.toml / requirements.txt /
-# Cargo.toml / go.mod.
+# Cargo.toml / go.mod, and the project's run tasks (npm scripts / make targets).
 project_context = true
+# Read the source around a failing error's file:line references into the prompt,
+# so the model debugs your real code instead of guessing. Only files inside the
+# project are read; .gitignore'd and secret files (.env, *.pem, ...) are skipped
+# and every snippet is redacted first.
+#   "off"    — never read source
+#   "local"  — only for a local backend (Ollama / localhost) — the default
+#   "always" — also for cloud backends, where your source leaves the machine
+read_source = "local"
 
 [llm]
 # Which backend to use: "ollama" | "claude" | "openai"
