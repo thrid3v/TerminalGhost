@@ -124,6 +124,10 @@ class TriggerHandler:
                 )
                 return
             prior = self._recent_exchange()
+            # Debugging a failure the daemon never saw the output of? The model
+            # is guessing — nudge the user to capture it (only when they're not
+            # feeding their own output via `explain`).
+            blind_cmd = None if pasted else self._blind_failure(cwd)
             prompt = self._assembler.assemble(
                 cwd, inline_context, intent=intent, prior_exchange=prior, pasted=pasted
             )
@@ -143,7 +147,11 @@ class TriggerHandler:
                     await emit("\n")
                 answer = "".join(collected)
                 self._record_exchange(raw_inline or "??", answer)
+                # Extract the suggestion BEFORE the nudge, so the nudge's own
+                # `tgr ...` is never mistaken for the command to apply.
                 self._record_suggestion(answer)
+                if blind_cmd:
+                    await emit(self._blind_nudge(blind_cmd))
             except LLMError as exc:
                 await emit(f"\nTerminalGhost error: {exc}\n")
 
@@ -214,6 +222,28 @@ class TriggerHandler:
             return False
         recent = self._db.get_recent_commands(limit=10)
         return not any(not e.cmd.strip().startswith("??") for e in recent)
+
+    def _blind_failure(self, cwd: str) -> str | None:
+        """The failing command here whose output was never captured, if any.
+
+        That's the case where the model is guessing — we can point the user at
+        `tgr` to fix it. Returns the command text, or None.
+        """
+        if self._db is None:
+            return None
+        err = self._db.get_last_error(cwd=cwd)
+        if err is None or err.output or err.cmd.strip().startswith("??"):
+            return None
+        return err.cmd
+
+    @staticmethod
+    def _blind_nudge(cmd: str) -> str:
+        """A gentle, visually-distinct note that output wasn't captured."""
+        one_line = cmd.strip().splitlines()[0][:80]
+        return (
+            "\n\n> 👻 I couldn't see that command's output, so this is a best "
+            f"guess. Run `tgr {one_line}` and ask again for a precise fix."
+        )
 
     def _recent_exchange(self) -> tuple[str, str] | None:
         if self._last_exchange is None:

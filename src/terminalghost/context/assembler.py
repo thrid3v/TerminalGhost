@@ -31,9 +31,24 @@ _GIT_TIMEOUT = 1.0  # seconds; a slow repo must not stall the query
 _MANIFEST_DEP_CAP = 12  # dependencies listed per manifest
 
 _PREAMBLE = (
-    "You are TerminalGhost, an assistant that lives in the user's terminal.\n"
-    "Using the shell context below, give a concise, actionable answer.\n"
-    "If a command failed, explain why and give the exact fix command first."
+    "You are TerminalGhost, an expert engineer living in the user's terminal.\n"
+    "Answer only from the shell context below — recent commands, the failing\n"
+    "command's output, source excerpts, and project facts. Be concise and\n"
+    "concrete.\n"
+    "\n"
+    "Rules:\n"
+    "- Ground every claim in what is actually shown. Never invent file names,\n"
+    "  flags, commands, package names, or error messages that do not appear in\n"
+    "  the context.\n"
+    "- When a command failed, state the real cause in one line, then give the\n"
+    "  exact fix command(s) FIRST in a code block (copy-paste ready), then at\n"
+    "  most one short line of why.\n"
+    "- If the failing command's output is NOT shown, say so plainly and tell the\n"
+    "  user to re-run it with `tgr <command>` so you can see the real error;\n"
+    "  give your best guess only after, and mark it as a guess.\n"
+    "- Prefer the project's real run tasks (shown in the project facts) over\n"
+    "  generic ones, and use any provided source excerpts to point at the exact\n"
+    "  line to change."
 )
 
 _RECAP_PREAMBLE = (
@@ -47,15 +62,15 @@ _RECAP_PREAMBLE = (
 # Extra instruction appended to the preamble for `?? fix` / `?? explain`.
 _INTENT_SUFFIX = {
     "fix": (
-        "\nThe user wants the fix only: respond with the corrected command(s)"
-        " first, then at most one short line explaining why."
+        "\n\nThe user wants the fix only: reply with the corrected command(s) in"
+        " a code block first, then at most one short line of why. No preamble."
     ),
     "explain": (
-        "\nThe user wants to understand: explain clearly and thoroughly, then"
-        " give the command if relevant."
+        "\n\nThe user wants to understand: explain the cause clearly using the"
+        " shown output and source, then give the command if one applies."
     ),
     "hint": (
-        "\nRespond with a SINGLE short line (max ~100 chars): the single most"
+        "\n\nRespond with a SINGLE short line (max ~100 chars): the single most"
         " likely fix as a command or a terse tip. No preamble, no markdown."
     ),
 }
@@ -173,6 +188,9 @@ class ContextAssembler:
     def _format_command_history(
         self, commands: list["CommandEvent"], last_error: "CommandEvent | None"
     ) -> str:
+        # Drop TerminalGhost's own ?? queries — they're noise to the model, not
+        # commands the user actually ran.
+        commands = [e for e in commands if not _is_trigger_cmd(e.cmd)]
         lines = ["## Recent commands (oldest first)"]
         error_id = last_error.id if last_error is not None else None
         for i, event in enumerate(commands, start=1):
@@ -195,6 +213,10 @@ class ContextAssembler:
         if event.output:
             lines.append("output:")
             lines.extend(event.output.splitlines()[:20])
+        else:
+            # Tell the model it's working blind so it asks for output instead of
+            # confidently guessing (see the preamble's tgr rule).
+            lines.append("output: (not captured — the user has not run this via tgr)")
         return "\n".join(lines)
 
     def _source_enabled(self, overrides) -> bool:
@@ -296,6 +318,14 @@ class ContextAssembler:
     def _estimate_tokens(text: str) -> int:
         """Rough estimate without a tokenizer: ~4 chars per token."""
         return len(text) // 4
+
+
+# -- helpers --------------------------------------------------------------------
+
+
+def _is_trigger_cmd(cmd: str) -> bool:
+    """True for TerminalGhost's own ?? queries (noise in the command history)."""
+    return cmd.strip().startswith("??")
 
 
 # -- project context helpers ----------------------------------------------------
